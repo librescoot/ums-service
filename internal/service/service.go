@@ -32,6 +32,8 @@ type Service struct {
 	mapsUpdater  *maps.Updater
 	wgManager    *wireguard.Manager
 	mu           sync.Mutex
+	detachCount  int
+	umsModeType  string
 }
 
 func New(cfg *config.Config) (*Service, error) {
@@ -99,8 +101,8 @@ func (s *Service) handleModeChange(mode string) error {
 	}
 
 	switch mode {
-	case "ums":
-		return s.switchToUMS()
+	case "ums", "ums-by-dbc":
+		return s.switchToUMS(mode)
 	case "normal":
 		return s.switchToNormal(prevMode)
 	default:
@@ -108,7 +110,7 @@ func (s *Service) handleModeChange(mode string) error {
 	}
 }
 
-func (s *Service) switchToUMS() error {
+func (s *Service) switchToUMS(mode string) error {
 	// Mount the drive first to prepare files
 	if err := s.diskMgr.Mount(); err != nil {
 		return fmt.Errorf("failed to mount drive: %w", err)
@@ -149,6 +151,7 @@ func (s *Service) switchToUMS() error {
 		return fmt.Errorf("failed to switch to UMS mode: %w", err)
 	}
 
+	s.umsModeType = mode
 	log.Println("Switched to UMS mode")
 	return nil
 }
@@ -267,7 +270,37 @@ func (s *Service) checkIfDBCNeeded(mountPoint string) bool {
 }
 
 func (s *Service) onDeviceDetached(mode string) {
-	if err := s.handleModeChange(mode); err != nil {
-		log.Printf("Error handling device detachment: %v", err)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	currentMode := s.usbCtrl.GetCurrentMode()
+	if currentMode != "ums" {
+		return
+	}
+
+	s.detachCount++
+
+	if s.umsModeType == "ums" && s.detachCount == 1 {
+		log.Println("ums mode: switching to normal after first disconnect")
+		if err := s.handleModeChange("normal"); err != nil {
+			log.Printf("Error handling device detachment: %v", err)
+		}
+		s.detachCount = 0
+		return
+	}
+
+	if s.umsModeType == "ums-by-dbc" {
+		if s.detachCount == 1 {
+			log.Println("ums-by-dbc mode: first disconnect, staying in UMS")
+			return
+		}
+		if s.detachCount == 2 {
+			log.Println("ums-by-dbc mode: second disconnect, switching to normal")
+			if err := s.handleModeChange("normal"); err != nil {
+				log.Printf("Error handling device detachment: %v", err)
+			}
+			s.detachCount = 0
+			return
+		}
 	}
 }
