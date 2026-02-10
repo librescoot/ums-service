@@ -52,14 +52,24 @@ The service can be configured via environment variables:
 The service monitors Redis for mode changes:
 
 ```bash
-# Switch to USB Mass Storage mode
+# Switch to USB Mass Storage mode (regular)
 redis-cli HSET usb mode ums
+redis-cli PUBLISH usb mode
+
+# Switch to USB Mass Storage mode (DBC-specific)
+# Stays in UMS mode after first disconnect, switches to normal after second disconnect
+redis-cli HSET usb mode ums-by-dbc
 redis-cli PUBLISH usb mode
 
 # Switch to normal (network) mode
 redis-cli HSET usb mode normal
 redis-cli PUBLISH usb mode
 ```
+
+### Mode Behavior
+
+- **ums**: Switches to normal mode after the first USB disconnect
+- **ums-by-dbc**: Stays in UMS mode after the first disconnect, only switches to normal after the second disconnect (useful for DBC updates where multiple disconnects may occur)
 
 ## USB Drive Structure
 
