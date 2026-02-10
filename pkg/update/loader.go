@@ -7,27 +7,30 @@ import (
 	"path/filepath"
 	"strings"
 
+	ipc "github.com/librescoot/redis-ipc"
 	"github.com/librescoot/ums-service/pkg/dbc"
-	"github.com/librescoot/ums-service/pkg/redis"
 )
 
 type Loader struct {
-	otaDir         string
-	dbcOtaDir      string
-	redisPublisher *redis.Publisher
-	dbcInterface   *dbc.Interface
+	otaDir       string
+	dbcOtaDir    string
+	client       *ipc.Client
+	dbcInterface *dbc.Interface
 }
 
-func New(dbcInterface *dbc.Interface) *Loader {
+func New(client *ipc.Client, dbcInterface *dbc.Interface) *Loader {
 	return &Loader{
 		otaDir:       "/data/ota",
 		dbcOtaDir:    "/data/ota",
+		client:       client,
 		dbcInterface: dbcInterface,
 	}
 }
 
-func (l *Loader) SetRedisPublisher(pub *redis.Publisher) {
-	l.redisPublisher = pub
+// SetRedisPublisher is kept for backward compatibility but is now a no-op
+// The redis-ipc client is passed directly to New()
+func (l *Loader) SetRedisPublisher(_ interface{}) {
+	// No-op: redis-ipc client is set via New()
 }
 
 func (l *Loader) PrepareUSB(usbMountPath string) error {
@@ -81,17 +84,14 @@ func (l *Loader) processMDBUpdate(srcPath string) error {
 	filename := filepath.Base(srcPath)
 	log.Printf("Processing MDB update: %s", filename)
 
-	if l.redisPublisher == nil {
-		return fmt.Errorf("redis publisher not configured")
-	}
-
 	dstPath := filepath.Join(l.otaDir, filename)
 
 	if err := os.Rename(srcPath, dstPath); err != nil {
 		return fmt.Errorf("failed to move update file: %w", err)
 	}
 
-	if err := l.redisPublisher.PushMDBUpdate(dstPath); err != nil {
+	_, err := l.client.LPush("scooter:update:mdb", fmt.Sprintf("update-from-file:%s", dstPath))
+	if err != nil {
 		return fmt.Errorf("failed to notify update service: %w", err)
 	}
 
@@ -102,10 +102,6 @@ func (l *Loader) processMDBUpdate(srcPath string) error {
 func (l *Loader) processDBCUpdate(srcPath string) error {
 	filename := filepath.Base(srcPath)
 	log.Printf("Processing DBC update: %s", filename)
-
-	if l.redisPublisher == nil {
-		return fmt.Errorf("redis publisher not configured")
-	}
 
 	if !l.dbcInterface.IsEnabled() {
 		return fmt.Errorf("DBC interface not enabled for update")
@@ -123,7 +119,8 @@ func (l *Loader) processDBCUpdate(srcPath string) error {
 
 	log.Printf("Copied DBC update to %s", remotePath)
 
-	if err := l.redisPublisher.PushDBCUpdate(remotePath); err != nil {
+	_, err := l.client.LPush("scooter:update:dbc", fmt.Sprintf("update-from-file:%s", remotePath))
+	if err != nil {
 		return fmt.Errorf("failed to notify update service: %w", err)
 	}
 

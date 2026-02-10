@@ -10,11 +10,11 @@ import (
 	"strings"
 	"sync"
 
+	ipc "github.com/librescoot/redis-ipc"
 	"github.com/librescoot/ums-service/pkg/config"
 	"github.com/librescoot/ums-service/pkg/dbc"
 	"github.com/librescoot/ums-service/pkg/disk"
 	"github.com/librescoot/ums-service/pkg/maps"
-	"github.com/librescoot/ums-service/pkg/redis"
 	"github.com/librescoot/ums-service/pkg/settings"
 	"github.com/librescoot/ums-service/pkg/update"
 	"github.com/librescoot/ums-service/pkg/usb"
@@ -23,7 +23,7 @@ import (
 
 type Service struct {
 	config       *config.Config
-	subscriber   *redis.Subscriber
+	watcher      *ipc.HashWatcher
 	usbCtrl      *usb.Controller
 	diskMgr      *disk.Manager
 	dbcInterface *dbc.Interface
@@ -35,14 +35,12 @@ type Service struct {
 }
 
 func New(cfg *config.Config) (*Service, error) {
-	subscriber, err := redis.NewSubscriber(
-		cfg.RedisAddr,
-		cfg.RedisPassword,
-		"", // channel parameter not used anymore
-		cfg.RedisDB,
+	client, err := ipc.New(
+		ipc.WithAddress(cfg.RedisAddr),
+		ipc.WithPort(6379),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create Redis subscriber: %w", err)
+		return nil, fmt.Errorf("failed to create Redis client: %w", err)
 	}
 
 	usbCtrl := usb.NewController(cfg.USBDriveFile)
@@ -51,19 +49,14 @@ func New(cfg *config.Config) (*Service, error) {
 	// Initialize components
 	dbcInterface := dbc.New("/data/dbc")
 	settingsLdr := settings.New()
-	updateLdr := update.New(dbcInterface)
 	mapsUpdater := maps.New(dbcInterface)
 	wgManager := wireguard.New()
 
-	updatePublisher, err := redis.NewPublisher(cfg.RedisAddr, cfg.RedisPassword, cfg.RedisDB)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create Redis publisher: %w", err)
-	}
-	updateLdr.SetRedisPublisher(updatePublisher)
+	updateLdr := update.New(client, dbcInterface)
 
 	svc := &Service{
 		config:       cfg,
-		subscriber:   subscriber,
+		watcher:      client.NewHashWatcher("usb"),
 		usbCtrl:      usbCtrl,
 		diskMgr:      diskMgr,
 		dbcInterface: dbcInterface,
@@ -73,7 +66,7 @@ func New(cfg *config.Config) (*Service, error) {
 		wgManager:    wgManager,
 	}
 
-	subscriber.SetModeHandler(svc.handleModeChange)
+	svc.watcher.OnField("mode", svc.handleModeChange)
 
 	return svc, nil
 }
@@ -85,7 +78,7 @@ func (s *Service) Run(ctx context.Context) error {
 		return fmt.Errorf("failed to initialize disk manager: %w", err)
 	}
 
-	return s.subscriber.Subscribe(ctx)
+	return s.watcher.StartWithSync()
 }
 
 func (s *Service) handleModeChange(mode string) error {
