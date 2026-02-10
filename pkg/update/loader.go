@@ -4,27 +4,30 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 
 	"github.com/librescoot/ums-service/pkg/dbc"
+	"github.com/librescoot/ums-service/pkg/redis"
 )
 
 type Loader struct {
-	otaDir      string
-	dbcOtaDir   string
-	needReboot  bool
-	dbcInterface *dbc.Interface
+	otaDir         string
+	dbcOtaDir      string
+	redisPublisher *redis.Publisher
+	dbcInterface   *dbc.Interface
 }
 
 func New(dbcInterface *dbc.Interface) *Loader {
 	return &Loader{
 		otaDir:       "/data/ota",
 		dbcOtaDir:    "/data/ota",
-		needReboot:   false,
 		dbcInterface: dbcInterface,
 	}
+}
+
+func (l *Loader) SetRedisPublisher(pub *redis.Publisher) {
+	l.redisPublisher = pub
 }
 
 func (l *Loader) PrepareUSB(usbMountPath string) error {
@@ -38,7 +41,7 @@ func (l *Loader) PrepareUSB(usbMountPath string) error {
 
 func (l *Loader) ProcessUpdates(usbMountPath string) error {
 	updateDir := filepath.Join(usbMountPath, "system-update")
-	
+
 	entries, err := os.ReadDir(updateDir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -54,7 +57,7 @@ func (l *Loader) ProcessUpdates(usbMountPath string) error {
 		}
 
 		filename := entry.Name()
-		if !strings.HasPrefix(filename, "librescoot-") || !strings.HasSuffix(filename, ".mender") {
+		if !strings.HasPrefix(filename, "librescoot-") || (!strings.HasSuffix(filename, ".mender") && !strings.HasSuffix(filename, ".delta")) {
 			continue
 		}
 
@@ -64,7 +67,6 @@ func (l *Loader) ProcessUpdates(usbMountPath string) error {
 			if err := l.processMDBUpdate(srcPath); err != nil {
 				return fmt.Errorf("failed to process MDB update: %w", err)
 			}
-			l.needReboot = true
 		} else if strings.Contains(filename, "librescoot-dbc") {
 			if err := l.processDBCUpdate(srcPath); err != nil {
 				return fmt.Errorf("failed to process DBC update: %w", err)
@@ -79,47 +81,56 @@ func (l *Loader) processMDBUpdate(srcPath string) error {
 	filename := filepath.Base(srcPath)
 	log.Printf("Processing MDB update: %s", filename)
 
-	// Run mender-update install directly from mount point
-	cmd := exec.Command("mender-update", "install", srcPath)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("mender-update install failed: %v, output: %s", err, string(output))
+	if l.redisPublisher == nil {
+		return fmt.Errorf("redis publisher not configured")
 	}
 
-	log.Printf("Successfully installed MDB update: %s", filename)
+	dstPath := filepath.Join(l.otaDir, filename)
+
+	if err := os.Rename(srcPath, dstPath); err != nil {
+		return fmt.Errorf("failed to move update file: %w", err)
+	}
+
+	if err := l.redisPublisher.PushMDBUpdate(dstPath); err != nil {
+		return fmt.Errorf("failed to notify update service: %w", err)
+	}
+
+	log.Printf("Successfully queued MDB update: %s", filename)
 	return nil
 }
 
 func (l *Loader) processDBCUpdate(srcPath string) error {
+	filename := filepath.Base(srcPath)
+	log.Printf("Processing DBC update: %s", filename)
+
+	if l.redisPublisher == nil {
+		return fmt.Errorf("redis publisher not configured")
+	}
+
 	if !l.dbcInterface.IsEnabled() {
 		return fmt.Errorf("DBC interface not enabled for update")
 	}
 
-	filename := filepath.Base(srcPath)
 	remotePath := filepath.Join(l.dbcOtaDir, filename)
 
-	// Create remote OTA directory
 	if _, err := l.dbcInterface.RunCommand(fmt.Sprintf("mkdir -p %s", l.dbcOtaDir)); err != nil {
 		return fmt.Errorf("failed to create remote OTA directory: %w", err)
 	}
 
-	// Copy file to DBC
 	if err := l.dbcInterface.CopyFile(srcPath, remotePath); err != nil {
 		return fmt.Errorf("failed to copy update to DBC: %w", err)
 	}
 
 	log.Printf("Copied DBC update to %s", remotePath)
 
-	// Run mender-update install on DBC
-	output, err := l.dbcInterface.RunCommand(fmt.Sprintf("mender-update install %s", remotePath))
-	if err != nil {
-		return fmt.Errorf("mender-update install failed on DBC: %v, output: %s", err, output)
+	if err := l.redisPublisher.PushDBCUpdate(remotePath); err != nil {
+		return fmt.Errorf("failed to notify update service: %w", err)
 	}
 
-	log.Printf("Successfully installed DBC update: %s", filename)
+	log.Printf("Successfully queued DBC update: %s", filename)
 	return nil
 }
 
 func (l *Loader) NeedReboot() bool {
-	return l.needReboot
+	return false
 }

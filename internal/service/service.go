@@ -47,13 +47,19 @@ func New(cfg *config.Config) (*Service, error) {
 
 	usbCtrl := usb.NewController(cfg.USBDriveFile)
 	diskMgr := disk.NewManager(cfg.USBDriveFile, cfg.USBDriveSize)
-	
+
 	// Initialize components
 	dbcInterface := dbc.New("/data/dbc")
 	settingsLdr := settings.New()
 	updateLdr := update.New(dbcInterface)
 	mapsUpdater := maps.New(dbcInterface)
 	wgManager := wireguard.New()
+
+	updatePublisher, err := redis.NewPublisher(cfg.RedisAddr, cfg.RedisPassword, cfg.RedisDB)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Redis publisher: %w", err)
+	}
+	updateLdr.SetRedisPublisher(updatePublisher)
 
 	svc := &Service{
 		config:       cfg,
@@ -81,7 +87,6 @@ func (s *Service) Run(ctx context.Context) error {
 
 	return s.subscriber.Subscribe(ctx)
 }
-
 
 func (s *Service) handleModeChange(mode string) error {
 	s.mu.Lock()
@@ -165,11 +170,10 @@ func (s *Service) switchToNormal(prevMode string) error {
 
 	ctx := context.Background()
 	mountPoint := s.diskMgr.GetMountPoint()
-	needReboot := false
 
 	// Check if we need DBC for any operations
 	needDBC := s.checkIfDBCNeeded(mountPoint)
-	
+
 	if needDBC {
 		// Enable DBC only if we need to transfer files
 		if err := s.dbcInterface.Enable(ctx); err != nil {
@@ -198,9 +202,6 @@ func (s *Service) switchToNormal(prevMode string) error {
 	if err := s.updateLdr.ProcessUpdates(mountPoint); err != nil {
 		log.Printf("Error processing updates: %v", err)
 	}
-	needReboot = s.updateLdr.NeedReboot()
-
-	// Process map updates
 	if err := s.mapsUpdater.ProcessMaps(mountPoint); err != nil {
 		log.Printf("Error processing maps: %v", err)
 	}
@@ -229,15 +230,7 @@ func (s *Service) switchToNormal(prevMode string) error {
 	}
 
 	log.Println("Switched to normal mode and processed files")
-
-	// Reboot if needed
-	if needReboot {
-		log.Println("Rebooting system after update...")
-		cmd := exec.Command("reboot")
-		if err := cmd.Run(); err != nil {
-			log.Printf("Failed to reboot: %v", err)
-		}
-	}
+	log.Println("Update files queued via Redis - update service will handle installation")
 
 	return nil
 }
