@@ -3,21 +3,30 @@ package usb
 import (
 	"fmt"
 	"log"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 )
 
 type Controller struct {
-	currentMode string
-	mu          sync.Mutex
-	driveFile   string
+	currentMode     string
+	mu              sync.Mutex
+	driveFile       string
+	stopMonitor     chan struct{}
+	monitorRunning  bool
+	modeChangeCb    func(mode string)
+	monitorInterval time.Duration
 }
 
 func NewController(driveFile string) *Controller {
 	return &Controller{
-		currentMode: "normal",
-		driveFile:   driveFile,
+		currentMode:     "normal",
+		driveFile:       driveFile,
+		stopMonitor:     make(chan struct{}),
+		monitorInterval: 2 * time.Second,
 	}
 }
 
@@ -54,7 +63,7 @@ func (c *Controller) switchToUMS() error {
 		log.Printf("Warning: failed to unload g_ether: %v", err)
 	}
 
-	if err := c.loadModule("g_mass_storage", 
+	if err := c.loadModule("g_mass_storage",
 		fmt.Sprintf("file=%s", c.driveFile),
 		"removable=1",
 		"ro=0",
@@ -108,4 +117,73 @@ func (c *Controller) GetCurrentMode() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.currentMode
+}
+
+func (c *Controller) SetModeChangeCallback(cb func(mode string)) {
+	c.modeChangeCb = cb
+}
+
+func (c *Controller) StartMonitoring() {
+	c.mu.Lock()
+	if c.monitorRunning {
+		c.mu.Unlock()
+		return
+	}
+	c.monitorRunning = true
+	c.mu.Unlock()
+
+	go c.monitorLoop()
+}
+
+func (c *Controller) StopMonitoring() {
+	close(c.stopMonitor)
+	c.mu.Lock()
+	c.monitorRunning = false
+	c.mu.Unlock()
+}
+
+func (c *Controller) monitorLoop() {
+	ticker := time.NewTicker(c.monitorInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-c.stopMonitor:
+			log.Println("USB monitoring stopped")
+			return
+		case <-ticker.C:
+			if !c.isDeviceAttached() && c.GetCurrentMode() == "ums" {
+				log.Println("Device detached detected, switching to normal mode")
+				if c.modeChangeCb != nil {
+					c.modeChangeCb("normal")
+				}
+				return
+			}
+		}
+	}
+}
+
+func (c *Controller) isDeviceAttached() bool {
+	usbPath := "/sys/kernel/config/usb_gadget"
+	if _, err := os.Stat(usbPath); os.IsNotExist(err) {
+		return false
+	}
+
+	entries, err := os.ReadDir(usbPath)
+	if err != nil {
+		return false
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			statePath := filepath.Join(usbPath, entry.Name(), "UDC")
+			if data, err := os.ReadFile(statePath); err == nil {
+				if strings.TrimSpace(string(data)) != "" {
+					return true
+				}
+			}
+		}
+	}
+
+	return false
 }

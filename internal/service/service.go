@@ -78,6 +78,14 @@ func (s *Service) Run(ctx context.Context) error {
 		return fmt.Errorf("failed to initialize disk manager: %w", err)
 	}
 
+	s.usbCtrl.SetModeChangeCallback(s.onDeviceDetached)
+	s.usbCtrl.StartMonitoring()
+
+	go func() {
+		<-ctx.Done()
+		s.usbCtrl.StopMonitoring()
+	}()
+
 	return s.watcher.StartWithSync()
 }
 
@@ -256,4 +264,10 @@ func (s *Service) checkIfDBCNeeded(mountPoint string) bool {
 
 	log.Println("No DBC operations needed")
 	return false
+}
+
+func (s *Service) onDeviceDetached(mode string) {
+	if err := s.handleModeChange(mode); err != nil {
+		log.Printf("Error handling device detachment: %v", err)
+	}
 }
