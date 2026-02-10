@@ -1,27 +1,28 @@
 package redis
 
 import (
-	"context"
 	"fmt"
 	"log"
 
-	"github.com/go-redis/redis/v8"
+	ipc "github.com/librescoot/redis-ipc"
 )
 
 type Publisher struct {
-	client *redis.Client
+	client *ipc.Client
 }
 
 func NewPublisher(addr, password string, db int) (*Publisher, error) {
-	client := redis.NewClient(&redis.Options{
-		Addr:     addr,
-		Password: password,
-		DB:       db,
-	})
+	opts := []ipc.Option{
+		ipc.WithAddress(addr),
+		ipc.WithPort(6379),
+	}
+	if password != "" {
+		opts = append(opts, ipc.WithURL(fmt.Sprintf("redis://:%s@%s:%d", password, addr, 6379)))
+	}
 
-	ctx := context.Background()
-	if err := client.Ping(ctx).Err(); err != nil {
-		return nil, fmt.Errorf("failed to connect to Redis: %w", err)
+	client, err := ipc.New(opts...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Redis client: %w", err)
 	}
 
 	return &Publisher{client: client}, nil
@@ -36,11 +37,10 @@ func (p *Publisher) PushMDBUpdate(filePath string) error {
 }
 
 func (p *Publisher) pushUpdate(queue, filePath string) error {
-	ctx := context.Background()
-	result, err := p.client.LPush(ctx, queue, fmt.Sprintf("update-from-file:%s", filePath)).Result()
+	_, err := p.client.LPush(queue, fmt.Sprintf("update-from-file:%s", filePath))
 	if err != nil {
 		return fmt.Errorf("failed to push update to %s: %w", queue, err)
 	}
-	log.Printf("Pushed update to %s (queue length: %d): %s", queue, result, filePath)
+	log.Printf("Pushed update to %s: %s", queue, filePath)
 	return nil
 }

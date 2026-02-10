@@ -6,91 +6,65 @@ import (
 	"log"
 	"strings"
 
-	"github.com/go-redis/redis/v8"
+	ipc "github.com/librescoot/redis-ipc"
 )
 
 type ModeHandler func(mode string) error
 
 type Subscriber struct {
-	client      *redis.Client
-	channel     string
-	modeHandler ModeHandler
+	watcher *ipc.HashWatcher
 }
 
-func NewSubscriber(addr, password, channel string, db int) (*Subscriber, error) {
-	client := redis.NewClient(&redis.Options{
-		Addr:     addr,
-		Password: password,
-		DB:       db,
-	})
-
-	ctx := context.Background()
-	if err := client.Ping(ctx).Err(); err != nil {
-		return nil, fmt.Errorf("failed to connect to Redis: %w", err)
+func NewSubscriber(addr, password string, _ string, db int) (*Subscriber, error) {
+	opts := []ipc.Option{
+		ipc.WithAddress(addr),
+		ipc.WithPort(6379),
+	}
+	if password != "" {
+		opts = append(opts, ipc.WithURL(fmt.Sprintf("redis://:%s@%s:%d", password, addr, 6379)))
 	}
 
-	return &Subscriber{
-		client:  client,
-		channel: channel,
-	}, nil
+	client, err := ipc.New(opts...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Redis client: %w", err)
+	}
+
+	sub := &Subscriber{
+		watcher: client.NewHashWatcher("usb"),
+	}
+
+	sub.watcher.OnField("mode", func(value string) error {
+		value = strings.TrimSpace(value)
+		if value == "ums" || value == "normal" {
+			log.Printf("Mode changed to: %s", value)
+			return nil
+		}
+		log.Printf("Invalid mode value: %s", value)
+		return nil
+	})
+
+	return sub, nil
 }
 
 func (s *Subscriber) SetModeHandler(handler ModeHandler) {
-	s.modeHandler = handler
+	s.watcher.OnField("mode", func(value string) error {
+		value = strings.TrimSpace(value)
+		if value == "ums" || value == "normal" {
+			log.Printf("Mode changed to: %s", value)
+			return handler(value)
+		}
+		log.Printf("Invalid mode value: %s", value)
+		return nil
+	})
 }
 
 func (s *Subscriber) Subscribe(ctx context.Context) error {
-	// Subscribe to the "usb" channel for PUBLISH messages
-	pubsub := s.client.Subscribe(ctx, "usb")
-	defer pubsub.Close()
-
-	ch := pubsub.Channel()
-
-	log.Printf("Subscribed to Redis channel: usb")
-
-	// Check initial mode
-	go s.handleModeChange(ctx)
-
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case msg := <-ch:
-			// Only process if the payload is "mode"
-			if msg.Payload == "mode" {
-				log.Printf("Received mode change notification")
-				go s.handleModeChange(ctx)
-			}
-		}
-	}
-}
-
-func (s *Subscriber) handleModeChange(ctx context.Context) {
-	// Get the mode from the "usb" hash, field "mode"
-	mode, err := s.client.HGet(ctx, "usb", "mode").Result()
-	if err != nil {
-		if err == redis.Nil {
-			// Key doesn't exist, default to normal
-			mode = "normal"
-		} else {
-			log.Printf("Error getting mode from Redis: %v", err)
-			return
-		}
-	}
-
-	mode = strings.TrimSpace(mode)
-	if mode == "ums" || mode == "normal" {
-		log.Printf("Mode changed to: %s", mode)
-		if s.modeHandler != nil {
-			if err := s.modeHandler(mode); err != nil {
-				log.Printf("Error handling mode change: %v", err)
-			}
-		}
-	} else {
-		log.Printf("Invalid mode value: %s", mode)
-	}
+	s.watcher.StartWithSync()
+	<-ctx.Done()
+	return ctx.Err()
 }
 
 func (s *Subscriber) Close() error {
-	return s.client.Close()
+	s.watcher.Stop()
+	return nil
 }
