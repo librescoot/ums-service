@@ -4,9 +4,11 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -37,9 +39,14 @@ type Service struct {
 }
 
 func New(cfg *config.Config) (*Service, error) {
+	redisHost, redisPort, err := parseRedisAddr(cfg.RedisAddr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid REDIS_ADDR %q: %w", cfg.RedisAddr, err)
+	}
+
 	client, err := ipc.New(
-		ipc.WithAddress(cfg.RedisAddr),
-		ipc.WithPort(6379),
+		ipc.WithAddress(redisHost),
+		ipc.WithPort(redisPort),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Redis client: %w", err)
@@ -71,6 +78,27 @@ func New(cfg *config.Config) (*Service, error) {
 	svc.watcher.OnField("mode", svc.handleModeChange)
 
 	return svc, nil
+}
+
+func parseRedisAddr(addr string) (string, int, error) {
+	const defaultPort = 6379
+
+	// REDIS_ADDR can be set as "host" or "host:port".
+	host, portStr, err := net.SplitHostPort(addr)
+	if err == nil {
+		port, convErr := strconv.Atoi(portStr)
+		if convErr != nil {
+			return "", 0, fmt.Errorf("invalid port %q", portStr)
+		}
+		return host, port, nil
+	}
+
+	// When no port is provided, use default Redis port.
+	if strings.Contains(err.Error(), "missing port in address") {
+		return addr, defaultPort, nil
+	}
+
+	return "", 0, err
 }
 
 func (s *Service) Run(ctx context.Context) error {
