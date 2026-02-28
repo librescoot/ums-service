@@ -375,25 +375,21 @@ func (s *Service) doSwitchToNormal() {
 
 // LED fade indices (from /usr/share/led-curves/fades/)
 const (
-	fadeParkingOn  = 0 // fade0-parking-smooth-on
-	fadeSmoothOff  = 1 // fade1-smooth-off
-	fadeDriveLitOn = 6 // fade6-drive-light-on
+	fadeSmoothOn  = 0 // fade0-parking-smooth-on
+	fadeSmoothOff = 1 // fade1-smooth-off
 )
 
-// LED channel sets for different indicator patterns.
-// Channels 0,1,2,5 are adaptive (non-blinker) LEDs.
+// Blinker LED channels (3,4,6,7) used as UMS indicators.
+// Continuous on = distinguishable from normal parked state.
 type ledPattern struct {
 	channels []int
 	fade     int
 }
 
 var (
-	// UMS active: parking lights on (subtle continuous glow)
-	ledsUMSActive = ledPattern{channels: []int{0, 1, 2, 5}, fade: fadeParkingOn}
-	// Waiting for PC: drive lights on (brighter continuous light)
-	ledsWaitingPC = ledPattern{channels: []int{0, 1, 2, 5}, fade: fadeDriveLitOn}
-	// Off: smooth off on all channels
-	ledsOff = ledPattern{channels: []int{0, 1, 2, 5}, fade: fadeSmoothOff}
+	ledsUMSActive = ledPattern{channels: []int{3, 4, 6, 7}, fade: fadeSmoothOn}
+	ledsWaitingPC = ledPattern{channels: []int{3, 4, 6, 7}, fade: fadeSmoothOn}
+	ledsOff       = ledPattern{channels: []int{3, 4, 6, 7}, fade: fadeSmoothOff}
 )
 
 func (s *Service) setLEDs(p ledPattern) {
