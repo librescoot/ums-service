@@ -388,13 +388,24 @@ type ledPattern struct {
 
 var (
 	ledsUMSActive = ledPattern{channels: []int{3, 4, 6, 7}, fade: fadeSmoothOn}
-	ledsWaitingPC = ledPattern{channels: []int{3, 4, 6, 7}, fade: fadeSmoothOn}
+	ledsWaitingPC = ledPattern{channels: []int{3, 4}, fade: fadeSmoothOn}
 	ledsOff       = ledPattern{channels: []int{3, 4, 6, 7}, fade: fadeSmoothOff}
 )
 
+var allBlinkerChannels = []int{3, 4, 6, 7}
+
 func (s *Service) setLEDs(p ledPattern) {
+	onSet := make(map[int]bool)
 	for _, ch := range p.channels {
-		if _, err := s.client.LPush("scooter:led:fade", fmt.Sprintf("%d:%d", ch, p.fade)); err != nil {
+		onSet[ch] = true
+	}
+
+	for _, ch := range allBlinkerChannels {
+		fade := p.fade
+		if !onSet[ch] {
+			fade = fadeSmoothOff
+		}
+		if _, err := s.client.LPush("scooter:led:fade", fmt.Sprintf("%d:%d", ch, fade)); err != nil {
 			log.Printf("Error setting LED channel %d: %v", ch, err)
 		}
 	}
