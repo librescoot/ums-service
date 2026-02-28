@@ -12,6 +12,12 @@ import (
 )
 
 func main() {
+	if os.Getenv("JOURNAL_STREAM") != "" {
+		log.SetFlags(0)
+	} else {
+		log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
+	}
+
 	cfg := config.New()
 
 	svc, err := service.New(cfg)

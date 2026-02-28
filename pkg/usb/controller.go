@@ -5,10 +5,16 @@ import (
 	"log"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
+)
+
+const (
+	udcStatePath = "/sys/class/udc/ci_hdrc.0/state"
+
+	// UDC states
+	udcStateConfigured = "configured"
 )
 
 type Controller struct {
@@ -17,7 +23,7 @@ type Controller struct {
 	driveFile       string
 	stopMonitor     chan struct{}
 	monitorRunning  bool
-	modeChangeCb    func(mode string)
+	detachCh        chan struct{}
 	monitorInterval time.Duration
 }
 
@@ -26,6 +32,7 @@ func NewController(driveFile string) *Controller {
 		currentMode:     "normal",
 		driveFile:       driveFile,
 		stopMonitor:     make(chan struct{}),
+		detachCh:        make(chan struct{}, 1),
 		monitorInterval: 2 * time.Second,
 	}
 }
@@ -119,8 +126,12 @@ func (c *Controller) GetCurrentMode() string {
 	return c.currentMode
 }
 
-func (c *Controller) SetModeChangeCallback(cb func(mode string)) {
-	c.modeChangeCb = cb
+// DetachCh returns a channel that receives a signal when a USB detach is
+// detected while in UMS mode. The service layer reads from this channel
+// to avoid the deadlock that occurred when the old callback called
+// handleModeChange directly while holding the service mutex.
+func (c *Controller) DetachCh() <-chan struct{} {
+	return c.detachCh
 }
 
 func (c *Controller) StartMonitoring() {
@@ -130,21 +141,31 @@ func (c *Controller) StartMonitoring() {
 		return
 	}
 	c.monitorRunning = true
+	c.stopMonitor = make(chan struct{})
 	c.mu.Unlock()
 
 	go c.monitorLoop()
 }
 
 func (c *Controller) StopMonitoring() {
-	close(c.stopMonitor)
 	c.mu.Lock()
+	if !c.monitorRunning {
+		c.mu.Unlock()
+		return
+	}
 	c.monitorRunning = false
+	close(c.stopMonitor)
 	c.mu.Unlock()
 }
 
+// monitorLoop polls UDC state to detect when the USB host disconnects.
+// It watches for transitions from "configured" (host present) to any other
+// state while in UMS mode, and signals via detachCh.
 func (c *Controller) monitorLoop() {
 	ticker := time.NewTicker(c.monitorInterval)
 	defer ticker.Stop()
+
+	wasConfigured := false
 
 	for {
 		select {
@@ -152,38 +173,38 @@ func (c *Controller) monitorLoop() {
 			log.Println("USB monitoring stopped")
 			return
 		case <-ticker.C:
-			if !c.isDeviceAttached() && c.GetCurrentMode() == "ums" {
-				log.Println("Device detached detected, switching to normal mode")
-				if c.modeChangeCb != nil {
-					c.modeChangeCb("normal")
+			if c.GetCurrentMode() != "ums" {
+				wasConfigured = false
+				continue
+			}
+
+			configured := c.isHostConnected()
+
+			if configured {
+				wasConfigured = true
+				continue
+			}
+
+			// Transition: configured → not configured = detach event
+			if wasConfigured {
+				wasConfigured = false
+				log.Println("USB host disconnected (UDC state left configured)")
+				select {
+				case c.detachCh <- struct{}{}:
+				default:
 				}
-				return
 			}
 		}
 	}
 }
 
-func (c *Controller) isDeviceAttached() bool {
-	usbPath := "/sys/kernel/config/usb_gadget"
-	if _, err := os.Stat(usbPath); os.IsNotExist(err) {
-		return false
-	}
-
-	entries, err := os.ReadDir(usbPath)
+// isHostConnected checks whether a USB host is actively connected by
+// reading the UDC state from sysfs. The "configured" state means the
+// host has completed enumeration and is using the gadget.
+func (c *Controller) isHostConnected() bool {
+	data, err := os.ReadFile(udcStatePath)
 	if err != nil {
 		return false
 	}
-
-	for _, entry := range entries {
-		if entry.IsDir() {
-			statePath := filepath.Join(usbPath, entry.Name(), "UDC")
-			if data, err := os.ReadFile(statePath); err == nil {
-				if strings.TrimSpace(string(data)) != "" {
-					return true
-				}
-			}
-		}
-	}
-
-	return false
+	return strings.TrimSpace(string(data)) == udcStateConfigured
 }

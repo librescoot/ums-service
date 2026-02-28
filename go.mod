@@ -2,10 +2,7 @@ module github.com/librescoot/ums-service
 
 go 1.22.1
 
-require (
-	github.com/go-redis/redis/v8 v8.11.5
-	github.com/librescoot/redis-ipc v0.10.3
-)
+require github.com/librescoot/redis-ipc v0.10.3
 
 require (
 	github.com/cespare/xxhash/v2 v2.2.0 // indirect

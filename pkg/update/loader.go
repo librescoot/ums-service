@@ -2,6 +2,7 @@ package update
 
 import (
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -25,12 +26,6 @@ func New(client *ipc.Client, dbcInterface *dbc.Interface) *Loader {
 		client:       client,
 		dbcInterface: dbcInterface,
 	}
-}
-
-// SetRedisPublisher is kept for backward compatibility but is now a no-op
-// The redis-ipc client is passed directly to New()
-func (l *Loader) SetRedisPublisher(_ interface{}) {
-	// No-op: redis-ipc client is set via New()
 }
 
 func (l *Loader) PrepareUSB(usbMountPath string) error {
@@ -84,10 +79,15 @@ func (l *Loader) processMDBUpdate(srcPath string) error {
 	filename := filepath.Base(srcPath)
 	log.Printf("Processing MDB update: %s", filename)
 
+	if err := os.MkdirAll(l.otaDir, 0755); err != nil {
+		return fmt.Errorf("failed to create OTA directory: %w", err)
+	}
+
 	dstPath := filepath.Join(l.otaDir, filename)
 
-	if err := os.Rename(srcPath, dstPath); err != nil {
-		return fmt.Errorf("failed to move update file: %w", err)
+	// Copy instead of rename — source is on vfat, destination on ext4
+	if err := copyFile(srcPath, dstPath); err != nil {
+		return fmt.Errorf("failed to copy update file: %w", err)
 	}
 
 	_, err := l.client.LPush("scooter:update:mdb", fmt.Sprintf("update-from-file:%s", dstPath))
@@ -97,6 +97,26 @@ func (l *Loader) processMDBUpdate(srcPath string) error {
 
 	log.Printf("Successfully queued MDB update: %s", filename)
 	return nil
+}
+
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	if _, err := io.Copy(out, in); err != nil {
+		return err
+	}
+
+	return out.Sync()
 }
 
 func (l *Loader) processDBCUpdate(srcPath string) error {
@@ -128,6 +148,3 @@ func (l *Loader) processDBCUpdate(srcPath string) error {
 	return nil
 }
 
-func (l *Loader) NeedReboot() bool {
-	return false
-}

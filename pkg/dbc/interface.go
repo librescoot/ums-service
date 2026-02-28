@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	ipc "github.com/librescoot/redis-ipc"
 )
 
 type Interface struct {
@@ -18,13 +20,15 @@ type Interface struct {
 	dataDir    string
 	httpServer *http.Server
 	enabled    bool
+	client     *ipc.Client
 }
 
-func New(dataDir string) *Interface {
+func New(dataDir string, client *ipc.Client) *Interface {
 	return &Interface{
 		ip:      "192.168.7.2",
 		port:    31337,
 		dataDir: dataDir,
+		client:  client,
 		enabled: false,
 	}
 }
@@ -35,17 +39,15 @@ func (i *Interface) Enable(ctx context.Context) error {
 	}
 
 	log.Println("Enabling DBC interface...")
-	cmd := exec.Command("/usr/bin/keycard.sh")
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("failed to run keycard.sh: %w", err)
+	if _, err := i.client.LPush("scooter:hardware", "dashboard:on"); err != nil {
+		return fmt.Errorf("failed to send dashboard power on command: %w", err)
 	}
 
-	// Wait for DBC to become reachable
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
-	
+
 	timeout := time.After(60 * time.Second)
-	
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -68,7 +70,7 @@ func (i *Interface) Disable() error {
 	}
 
 	log.Println("Disabling DBC interface...")
-	
+
 	if i.httpServer != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -78,9 +80,8 @@ func (i *Interface) Disable() error {
 		i.httpServer = nil
 	}
 
-	cmd := exec.Command("/usr/bin/keycard.sh")
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("failed to run keycard.sh to disable: %w", err)
+	if _, err := i.client.LPush("scooter:hardware", "dashboard:off"); err != nil {
+		return fmt.Errorf("failed to send dashboard power off command: %w", err)
 	}
 
 	i.enabled = false
@@ -123,12 +124,12 @@ func (i *Interface) DownloadFile(localPath, remotePath string) error {
 	filename := filepath.Base(localPath)
 	url := fmt.Sprintf("http://192.168.7.1:%d/%s", i.port, filename)
 
-	cmd := exec.Command("ssh", 
+	cmd := exec.Command("ssh",
 		"-o", "StrictHostKeyChecking=no",
 		"-o", "UserKnownHostsFile=/dev/null",
 		fmt.Sprintf("root@%s", i.ip),
 		fmt.Sprintf("wget -O %s %s", remotePath, url))
-	
+
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("failed to download file via SSH: %v, output: %s", err, string(output))
@@ -148,7 +149,7 @@ func (i *Interface) CopyFile(localPath, remotePath string) error {
 		"-o", "UserKnownHostsFile=/dev/null",
 		localPath,
 		fmt.Sprintf("root@%s:%s", i.ip, remotePath))
-	
+
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("failed to copy file: %v, output: %s", err, string(output))
@@ -168,7 +169,7 @@ func (i *Interface) RunCommand(command string) (string, error) {
 		"-o", "UserKnownHostsFile=/dev/null",
 		fmt.Sprintf("root@%s", i.ip),
 		command)
-	
+
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("failed to run command: %v, output: %s", err, string(output))

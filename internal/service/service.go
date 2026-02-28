@@ -26,6 +26,7 @@ import (
 type Service struct {
 	config       *config.Config
 	watcher      *ipc.HashWatcher
+	publisher    *ipc.HashPublisher
 	usbCtrl      *usb.Controller
 	diskMgr      *disk.Manager
 	dbcInterface *dbc.Interface
@@ -55,8 +56,7 @@ func New(cfg *config.Config) (*Service, error) {
 	usbCtrl := usb.NewController(cfg.USBDriveFile)
 	diskMgr := disk.NewManager(cfg.USBDriveFile, cfg.USBDriveSize)
 
-	// Initialize components
-	dbcInterface := dbc.New("/data/dbc")
+	dbcInterface := dbc.New("/data/dbc", client)
 	settingsLdr := settings.New()
 	mapsUpdater := maps.New(dbcInterface)
 	wgManager := wireguard.New()
@@ -66,6 +66,7 @@ func New(cfg *config.Config) (*Service, error) {
 	svc := &Service{
 		config:       cfg,
 		watcher:      client.NewHashWatcher("usb"),
+		publisher:    client.NewHashPublisher("usb"),
 		usbCtrl:      usbCtrl,
 		diskMgr:      diskMgr,
 		dbcInterface: dbcInterface,
@@ -83,7 +84,6 @@ func New(cfg *config.Config) (*Service, error) {
 func parseRedisAddr(addr string) (string, int, error) {
 	const defaultPort = 6379
 
-	// REDIS_ADDR can be set as "host" or "host:port".
 	host, portStr, err := net.SplitHostPort(addr)
 	if err == nil {
 		port, convErr := strconv.Atoi(portStr)
@@ -93,7 +93,6 @@ func parseRedisAddr(addr string) (string, int, error) {
 		return host, port, nil
 	}
 
-	// When no port is provided, use default Redis port.
 	if strings.Contains(err.Error(), "missing port in address") {
 		return addr, defaultPort, nil
 	}
@@ -108,15 +107,38 @@ func (s *Service) Run(ctx context.Context) error {
 		return fmt.Errorf("failed to initialize disk manager: %w", err)
 	}
 
-	s.usbCtrl.SetModeChangeCallback(s.onDeviceDetached)
 	s.usbCtrl.StartMonitoring()
+
+	go s.detachLoop(ctx)
 
 	go func() {
 		<-ctx.Done()
 		s.usbCtrl.StopMonitoring()
 	}()
 
-	return s.watcher.StartWithSync()
+	// StartWithSync is non-blocking: it subscribes to the Redis channel,
+	// syncs current hash state, then processes messages in a goroutine.
+	if err := s.watcher.StartWithSync(); err != nil {
+		return fmt.Errorf("failed to start hash watcher: %w", err)
+	}
+
+	log.Println("UMS service running, waiting for mode changes...")
+	<-ctx.Done()
+	return nil
+}
+
+// detachLoop reads USB detach signals from the controller and handles
+// the mode transition back to normal. Running in its own goroutine
+// ensures the service mutex is acquired cleanly without reentrancy.
+func (s *Service) detachLoop(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-s.usbCtrl.DetachCh():
+			s.onDeviceDetached()
+		}
+	}
 }
 
 func (s *Service) handleModeChange(mode string) error {
@@ -139,29 +161,24 @@ func (s *Service) handleModeChange(mode string) error {
 }
 
 func (s *Service) switchToUMS(mode string) error {
-	// Mount the drive first to prepare files
 	if err := s.diskMgr.Mount(); err != nil {
 		return fmt.Errorf("failed to mount drive: %w", err)
 	}
 
 	mountPoint := s.diskMgr.GetMountPoint()
 
-	// Copy settings to USB
 	if err := s.settingsLdr.CopyToUSB(mountPoint); err != nil {
 		log.Printf("Error copying settings to USB: %v", err)
 	}
 
-	// Prepare update directory
 	if err := s.updateLdr.PrepareUSB(mountPoint); err != nil {
 		log.Printf("Error preparing update directory: %v", err)
 	}
 
-	// Prepare maps directory
 	if err := s.mapsUpdater.PrepareUSB(mountPoint); err != nil {
 		log.Printf("Error preparing maps directory: %v", err)
 	}
 
-	// Prepare WireGuard directory and copy configs
 	if err := s.wgManager.PrepareUSB(mountPoint); err != nil {
 		log.Printf("Error preparing wireguard directory: %v", err)
 	}
@@ -169,23 +186,21 @@ func (s *Service) switchToUMS(mode string) error {
 		log.Printf("Error copying wireguard configs to USB: %v", err)
 	}
 
-	// Unmount before switching to UMS mode
 	if err := s.diskMgr.Unmount(); err != nil {
 		return fmt.Errorf("failed to unmount drive: %w", err)
 	}
 
-	// Switch USB mode
 	if err := s.usbCtrl.SwitchMode("ums"); err != nil {
 		return fmt.Errorf("failed to switch to UMS mode: %w", err)
 	}
 
 	s.umsModeType = mode
-	log.Println("Switched to UMS mode")
+	s.detachCount = 0
+	log.Printf("Switched to UMS mode (type: %s)", mode)
 	return nil
 }
 
 func (s *Service) switchToNormal(prevMode string) error {
-	// Switch USB mode first
 	if err := s.usbCtrl.SwitchMode("normal"); err != nil {
 		return fmt.Errorf("failed to switch to normal mode: %w", err)
 	}
@@ -194,27 +209,21 @@ func (s *Service) switchToNormal(prevMode string) error {
 		return nil
 	}
 
-	// Mount the drive to process files
 	if err := s.diskMgr.Mount(); err != nil {
 		return fmt.Errorf("failed to mount drive: %w", err)
 	}
-	defer s.diskMgr.Unmount()
 
 	ctx := context.Background()
 	mountPoint := s.diskMgr.GetMountPoint()
 
-	// Check if we need DBC for any operations
 	needDBC := s.checkIfDBCNeeded(mountPoint)
 
 	if needDBC {
-		// Enable DBC only if we need to transfer files
 		if err := s.dbcInterface.Enable(ctx); err != nil {
 			log.Printf("Warning: failed to enable DBC: %v", err)
-			// Continue with other operations
 		}
 	}
 
-	// Process settings
 	settingsChanged := false
 	if changed, err := s.settingsLdr.CopyFromUSB(mountPoint); err != nil {
 		log.Printf("Error processing settings: %v", err)
@@ -222,7 +231,6 @@ func (s *Service) switchToNormal(prevMode string) error {
 		settingsChanged = changed
 	}
 
-	// Process WireGuard configs
 	wgChanged := false
 	if changed, err := s.wgManager.SyncFromUSB(mountPoint); err != nil {
 		log.Printf("Error processing wireguard configs: %v", err)
@@ -230,7 +238,6 @@ func (s *Service) switchToNormal(prevMode string) error {
 		wgChanged = changed
 	}
 
-	// Process system updates
 	if err := s.updateLdr.ProcessUpdates(mountPoint); err != nil {
 		log.Printf("Error processing updates: %v", err)
 	}
@@ -238,7 +245,6 @@ func (s *Service) switchToNormal(prevMode string) error {
 		log.Printf("Error processing maps: %v", err)
 	}
 
-	// Restart settings-service once if any config changed
 	if settingsChanged || wgChanged {
 		log.Println("Configuration changed, restarting settings-service")
 		cmd := exec.Command("systemctl", "restart", "settings-service")
@@ -249,18 +255,21 @@ func (s *Service) switchToNormal(prevMode string) error {
 		}
 	}
 
-	// Clean the USB drive
 	if err := s.diskMgr.CleanDrive(); err != nil {
 		log.Printf("Error cleaning USB drive: %v", err)
 	}
 
-	// Disable DBC if it was enabled
+	if err := s.diskMgr.Unmount(); err != nil {
+		log.Printf("Error unmounting USB drive: %v", err)
+	}
+
 	if needDBC {
 		if err := s.dbcInterface.Disable(); err != nil {
 			log.Printf("Warning: failed to disable DBC: %v", err)
 		}
 	}
 
+	s.umsModeType = ""
 	log.Println("Switched to normal mode and processed files")
 	log.Println("Update files queued via Redis - update service will handle installation")
 
@@ -268,7 +277,6 @@ func (s *Service) switchToNormal(prevMode string) error {
 }
 
 func (s *Service) checkIfDBCNeeded(mountPoint string) bool {
-	// Check for DBC updates
 	updateDir := filepath.Join(mountPoint, "system-update")
 	if entries, err := os.ReadDir(updateDir); err == nil {
 		for _, entry := range entries {
@@ -279,7 +287,6 @@ func (s *Service) checkIfDBCNeeded(mountPoint string) bool {
 		}
 	}
 
-	// Check for map files
 	mapsDir := filepath.Join(mountPoint, "maps")
 	if entries, err := os.ReadDir(mapsDir); err == nil {
 		for _, entry := range entries {
@@ -297,7 +304,10 @@ func (s *Service) checkIfDBCNeeded(mountPoint string) bool {
 	return false
 }
 
-func (s *Service) onDeviceDetached(mode string) {
+// onDeviceDetached is called from detachLoop when the USB monitor detects
+// that the host has disconnected. It tracks the detach count to support
+// the ums-by-dbc mode which requires two disconnects before switching back.
+func (s *Service) onDeviceDetached() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -307,28 +317,39 @@ func (s *Service) onDeviceDetached(mode string) {
 	}
 
 	s.detachCount++
+	log.Printf("USB detach #%d detected (mode type: %s)", s.detachCount, s.umsModeType)
 
-	if s.umsModeType == "ums" && s.detachCount == 1 {
-		log.Println("ums mode: switching to normal after first disconnect")
-		if err := s.handleModeChange("normal"); err != nil {
-			log.Printf("Error handling device detachment: %v", err)
+	switch s.umsModeType {
+	case "ums":
+		if s.detachCount >= 1 {
+			log.Println("ums mode: switching to normal after disconnect")
+			s.doSwitchToNormal()
 		}
-		s.detachCount = 0
-		return
-	}
-
-	if s.umsModeType == "ums-by-dbc" {
+	case "ums-by-dbc":
 		if s.detachCount == 1 {
 			log.Println("ums-by-dbc mode: first disconnect, staying in UMS")
 			return
 		}
-		if s.detachCount == 2 {
+		if s.detachCount >= 2 {
 			log.Println("ums-by-dbc mode: second disconnect, switching to normal")
-			if err := s.handleModeChange("normal"); err != nil {
-				log.Printf("Error handling device detachment: %v", err)
-			}
-			s.detachCount = 0
-			return
+			s.doSwitchToNormal()
 		}
+	default:
+		log.Printf("Unknown UMS mode type %q, switching to normal", s.umsModeType)
+		s.doSwitchToNormal()
+	}
+}
+
+// doSwitchToNormal performs the switch without re-acquiring the mutex.
+// Must be called with s.mu held.
+func (s *Service) doSwitchToNormal() {
+	prevMode := s.usbCtrl.GetCurrentMode()
+	if err := s.switchToNormal(prevMode); err != nil {
+		log.Printf("Error switching to normal mode: %v", err)
+	}
+	s.detachCount = 0
+
+	if err := s.publisher.Set("mode", "normal", ipc.Sync()); err != nil {
+		log.Printf("Error updating Redis usb mode: %v", err)
 	}
 }
