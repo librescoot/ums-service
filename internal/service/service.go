@@ -25,6 +25,7 @@ import (
 
 type Service struct {
 	config       *config.Config
+	client       *ipc.Client
 	watcher      *ipc.HashWatcher
 	publisher    *ipc.HashPublisher
 	usbCtrl      *usb.Controller
@@ -65,6 +66,7 @@ func New(cfg *config.Config) (*Service, error) {
 
 	svc := &Service{
 		config:       cfg,
+		client:       client,
 		watcher:      client.NewHashWatcher("usb"),
 		publisher:    client.NewHashPublisher("usb"),
 		usbCtrl:      usbCtrl,
@@ -161,7 +163,10 @@ func (s *Service) handleModeChange(mode string) error {
 }
 
 func (s *Service) switchToUMS(mode string) error {
+	s.setStatus("preparing")
+
 	if err := s.diskMgr.Mount(); err != nil {
+		s.setStatus("idle")
 		return fmt.Errorf("failed to mount drive: %w", err)
 	}
 
@@ -187,10 +192,17 @@ func (s *Service) switchToUMS(mode string) error {
 	}
 
 	if err := s.diskMgr.Unmount(); err != nil {
+		s.setStatus("idle")
 		return fmt.Errorf("failed to unmount drive: %w", err)
 	}
 
+	// Publish status BEFORE switching USB — DBC can still read Redis via g_ether
+	s.setStatus("active")
+	s.setLEDs(ledsUMSActive)
+
 	if err := s.usbCtrl.SwitchMode("ums"); err != nil {
+		s.setStatus("idle")
+		s.setLEDs(ledsOff)
 		return fmt.Errorf("failed to switch to UMS mode: %w", err)
 	}
 
@@ -201,15 +213,21 @@ func (s *Service) switchToUMS(mode string) error {
 }
 
 func (s *Service) switchToNormal(prevMode string) error {
+	s.setLEDs(ledsOff)
+
 	if err := s.usbCtrl.SwitchMode("normal"); err != nil {
 		return fmt.Errorf("failed to switch to normal mode: %w", err)
 	}
 
 	if prevMode != "ums" {
+		s.setStatus("idle")
 		return nil
 	}
 
+	s.setStatus("processing")
+
 	if err := s.diskMgr.Mount(); err != nil {
+		s.setStatus("idle")
 		return fmt.Errorf("failed to mount drive: %w", err)
 	}
 
@@ -270,8 +288,8 @@ func (s *Service) switchToNormal(prevMode string) error {
 	}
 
 	s.umsModeType = ""
+	s.setStatus("idle")
 	log.Println("Switched to normal mode and processed files")
-	log.Println("Update files queued via Redis - update service will handle installation")
 
 	return nil
 }
@@ -327,7 +345,8 @@ func (s *Service) onDeviceDetached() {
 		}
 	case "ums-by-dbc":
 		if s.detachCount == 1 {
-			log.Println("ums-by-dbc mode: first disconnect, staying in UMS")
+			log.Println("ums-by-dbc mode: first disconnect, waiting for PC")
+			s.setLEDs(ledsWaitingPC)
 			return
 		}
 		if s.detachCount >= 2 {
@@ -351,5 +370,42 @@ func (s *Service) doSwitchToNormal() {
 
 	if err := s.publisher.Set("mode", "normal", ipc.Sync()); err != nil {
 		log.Printf("Error updating Redis usb mode: %v", err)
+	}
+}
+
+// LED fade indices (from /usr/share/led-curves/fades/)
+const (
+	fadeParkingOn  = 0 // fade0-parking-smooth-on
+	fadeSmoothOff  = 1 // fade1-smooth-off
+	fadeDriveLitOn = 6 // fade6-drive-light-on
+)
+
+// LED channel sets for different indicator patterns.
+// Channels 0,1,2,5 are adaptive (non-blinker) LEDs.
+type ledPattern struct {
+	channels []int
+	fade     int
+}
+
+var (
+	// UMS active: parking lights on (subtle continuous glow)
+	ledsUMSActive = ledPattern{channels: []int{0, 1, 2, 5}, fade: fadeParkingOn}
+	// Waiting for PC: drive lights on (brighter continuous light)
+	ledsWaitingPC = ledPattern{channels: []int{0, 1, 2, 5}, fade: fadeDriveLitOn}
+	// Off: smooth off on all channels
+	ledsOff = ledPattern{channels: []int{0, 1, 2, 5}, fade: fadeSmoothOff}
+)
+
+func (s *Service) setLEDs(p ledPattern) {
+	for _, ch := range p.channels {
+		if _, err := s.client.LPush("scooter:led:fade", fmt.Sprintf("%d:%d", ch, p.fade)); err != nil {
+			log.Printf("Error setting LED channel %d: %v", ch, err)
+		}
+	}
+}
+
+func (s *Service) setStatus(status string) {
+	if err := s.publisher.Set("status", status, ipc.Sync()); err != nil {
+		log.Printf("Error publishing usb status %q: %v", status, err)
 	}
 }
