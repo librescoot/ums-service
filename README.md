@@ -85,7 +85,7 @@ When in UMS mode, the virtual drive contains:
 │   └── librescoot-dbc-*.mender
 └── maps/               # Place map files here
     ├── *.mbtiles
-    └── *tiles.tar
+    └── *tiles.tar or valhalla_tiles_*.tar
 ```
 
 ## File Processing
@@ -184,4 +184,3 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 ---
 
 Made with ❤️ by the LibreScoot community
-
