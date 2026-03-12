@@ -48,79 +48,80 @@ func (i *Installer) ProcessRPMs(usbMountPath string) error {
 	return nil
 }
 
-func (i *Installer) processMDBRPMs(usbMountPath string) error {
-	mdbDir := filepath.Join(usbMountPath, "rpms", "mdb")
-
-	entries, err := os.ReadDir(mdbDir)
+func collectRPMs(dir string) []string {
+	entries, err := os.ReadDir(dir)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return fmt.Errorf("failed to read rpms/mdb directory: %w", err)
+		return nil
 	}
-
+	var paths []string
 	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".rpm") {
-			continue
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".rpm") {
+			paths = append(paths, filepath.Join(dir, entry.Name()))
 		}
-
-		rpmPath := filepath.Join(mdbDir, entry.Name())
-		log.Printf("Installing MDB RPM: %s", entry.Name())
-
-		cmd := exec.Command("rpm", "-Uvh", rpmPath)
-		output, err := cmd.CombinedOutput()
-		if err != nil {
-			log.Printf("Failed to install %s: %v, output: %s", entry.Name(), err, string(output))
-			continue
-		}
-
-		log.Printf("Successfully installed MDB RPM: %s", entry.Name())
 	}
-
-	return nil
+	return paths
 }
 
-func (i *Installer) processDBCRPMs(usbMountPath string) error {
-	dbcDir := filepath.Join(usbMountPath, "rpms", "dbc")
-
-	entries, err := os.ReadDir(dbcDir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return fmt.Errorf("failed to read rpms/dbc directory: %w", err)
-	}
-
-	if !i.dbcInterface.IsEnabled() {
-		for _, entry := range entries {
-			if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".rpm") {
-				return fmt.Errorf("DBC interface not enabled for RPM installation")
-			}
-		}
+func (i *Installer) processMDBRPMs(usbMountPath string) error {
+	rpms := collectRPMs(filepath.Join(usbMountPath, "rpms", "mdb"))
+	if len(rpms) == 0 {
 		return nil
 	}
 
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".rpm") {
-			continue
-		}
+	log.Printf("Installing %d MDB RPM(s)", len(rpms))
 
-		localPath := filepath.Join(dbcDir, entry.Name())
-		remotePath := filepath.Join("/tmp", entry.Name())
-		log.Printf("Installing DBC RPM: %s", entry.Name())
+	args := append([]string{"-Uvh", "--force"}, rpms...)
+	cmd := exec.Command("rpm", args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("rpm install failed: %v, output: %s", err, string(output))
+	}
+
+	log.Printf("MDB RPM install output: %s", string(output))
+	return nil
+}
+
+const dbcRPMDir = "/tmp/ums-rpms"
+
+func (i *Installer) processDBCRPMs(usbMountPath string) error {
+	rpms := collectRPMs(filepath.Join(usbMountPath, "rpms", "dbc"))
+	if len(rpms) == 0 {
+		return nil
+	}
+
+	if !i.dbcInterface.IsEnabled() {
+		return fmt.Errorf("DBC interface not enabled for RPM installation")
+	}
+
+	log.Printf("Installing %d DBC RPM(s)", len(rpms))
+
+	if _, err := i.dbcInterface.RunCommand(fmt.Sprintf("mkdir -p %s", dbcRPMDir)); err != nil {
+		return fmt.Errorf("failed to create remote RPM directory: %w", err)
+	}
+
+	var remoteFiles []string
+	for _, localPath := range rpms {
+		filename := filepath.Base(localPath)
+		remotePath := fmt.Sprintf("%s/%s", dbcRPMDir, filename)
 
 		if err := i.dbcInterface.CopyFile(localPath, remotePath); err != nil {
-			log.Printf("Failed to copy %s to DBC: %v", entry.Name(), err)
-			continue
+			return fmt.Errorf("failed to copy %s to DBC: %w", filename, err)
 		}
+		remoteFiles = append(remoteFiles, remotePath)
+	}
 
-		output, err := i.dbcInterface.RunCommand(fmt.Sprintf("rpm -Uvh %s", remotePath))
-		if err != nil {
-			log.Printf("Failed to install %s on DBC: %v", entry.Name(), err)
-			continue
-		}
+	installCmd := fmt.Sprintf("rpm -Uvh --force %s", strings.Join(remoteFiles, " "))
+	output, err := i.dbcInterface.RunCommand(installCmd)
+	if err != nil {
+		// Clean up even on failure
+		i.dbcInterface.RunCommand(fmt.Sprintf("rm -rf %s", dbcRPMDir))
+		return fmt.Errorf("DBC rpm install failed: %v", err)
+	}
 
-		log.Printf("Successfully installed DBC RPM %s: %s", entry.Name(), output)
+	log.Printf("DBC RPM install output: %s", output)
+
+	if _, err := i.dbcInterface.RunCommand(fmt.Sprintf("rm -rf %s", dbcRPMDir)); err != nil {
+		log.Printf("Failed to clean up remote RPMs: %v", err)
 	}
 
 	return nil
