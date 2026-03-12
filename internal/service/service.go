@@ -246,6 +246,7 @@ func (s *Service) switchToNormal(prevMode string) error {
 	}
 
 	if prevMode != "ums" {
+		s.setStep("")
 		s.setStatus("idle")
 		return nil
 	}
@@ -253,6 +254,7 @@ func (s *Service) switchToNormal(prevMode string) error {
 	s.setStatus("processing")
 
 	if err := s.diskMgr.Mount(); err != nil {
+		s.setStep("")
 		s.setStatus("idle")
 		return fmt.Errorf("failed to mount drive: %w", err)
 	}
