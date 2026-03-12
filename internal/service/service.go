@@ -177,6 +177,10 @@ func (s *Service) handleModeChange(mode string) error {
 func (s *Service) switchToUMS(mode string) error {
 	s.setStatus("preparing")
 
+	if _, err := s.client.Del("usb:log"); err != nil {
+		log.Printf("Warning: failed to clear usb:log: %v", err)
+	}
+
 	if err := s.diskMgr.Mount(); err != nil {
 		s.setStatus("idle")
 		return fmt.Errorf("failed to mount drive: %w", err)
@@ -255,83 +259,80 @@ func (s *Service) switchToNormal(prevMode string) error {
 
 	ctx := context.Background()
 	mountPoint := s.diskMgr.GetMountPoint()
-	umsLog := umslog.New()
-
-	umsLog.Log("Starting USB file processing")
+	logger := umslog.New(s.client)
 
 	needDBC := s.checkIfDBCNeeded(mountPoint)
 
 	if needDBC {
-		umsLog.Log("DBC needed, enabling...")
 		if err := s.dbcInterface.Enable(ctx); err != nil {
-			umsLog.Error("dbc", "Failed to enable: %v", err)
+			logger.Error("dbc", "Failed to enable: %v", err)
 			log.Printf("Warning: failed to enable DBC: %v", err)
 		} else {
-			umsLog.Logf("dbc", "Enabled successfully")
+			logger.Logf("dbc", "enabled")
 		}
 	}
 
+	s.setStep("settings")
 	settingsChanged := false
-	umsLog.Logf("settings", "Processing settings...")
 	if changed, err := s.settingsLdr.CopyFromUSB(mountPoint); err != nil {
-		umsLog.Error("settings", "Failed: %v", err)
+		logger.Error("settings", "%v", err)
 		log.Printf("Error processing settings: %v", err)
 	} else {
-		umsLog.Logf("settings", "Settings synced (changed: %v)", changed)
+		logger.Logf("settings", "done (changed=%v)", changed)
 		settingsChanged = changed
 	}
 
+	s.setStep("wireguard")
 	wgChanged := false
-	umsLog.Logf("wireguard", "Processing configs...")
 	if changed, err := s.wgManager.SyncFromUSB(mountPoint); err != nil {
-		umsLog.Error("wireguard", "Failed: %v", err)
+		logger.Error("wireguard", "%v", err)
 		log.Printf("Error processing wireguard configs: %v", err)
 	} else {
-		umsLog.Logf("wireguard", "Configs synced (changed: %v)", changed)
+		logger.Logf("wireguard", "done (changed=%v)", changed)
 		wgChanged = changed
 	}
 
-	umsLog.Logf("updates", "Processing system updates...")
+	s.setStep("updates")
 	if err := s.updateLdr.ProcessUpdates(mountPoint); err != nil {
-		umsLog.Error("updates", "Failed: %v", err)
+		logger.Error("updates", "%v", err)
 		log.Printf("Error processing updates: %v", err)
 	} else {
-		umsLog.Logf("updates", "Complete")
+		logger.Logf("updates", "done")
 	}
 
-	umsLog.Logf("maps", "Processing maps...")
+	s.setStep("maps")
 	if err := s.mapsUpdater.ProcessMaps(mountPoint); err != nil {
-		umsLog.Error("maps", "Failed: %v", err)
+		logger.Error("maps", "%v", err)
 		log.Printf("Error processing maps: %v", err)
 	} else {
-		umsLog.Logf("maps", "Complete")
+		logger.Logf("maps", "done")
 	}
 
 	if err := s.rpmInstaller.ProcessRPMs(mountPoint); err != nil {
+		logger.Error("rpms", "%v", err)
 		log.Printf("Error processing RPMs: %v", err)
+	} else {
+		logger.Logf("rpms", "done")
 	}
 	if err := s.scriptRunner.ProcessScripts(mountPoint); err != nil {
+		logger.Error("scripts", "%v", err)
 		log.Printf("Error processing scripts: %v", err)
 	}
 
 	if settingsChanged || wgChanged {
-		umsLog.Log("Configuration changed, restarting settings-service")
 		log.Println("Configuration changed, restarting settings-service")
 		cmd := exec.Command("systemctl", "restart", "settings-service")
 		if output, err := cmd.CombinedOutput(); err != nil {
-			umsLog.Error("service", "Failed to restart settings-service: %v", err)
+			logger.Error("settings-service", "restart failed: %v", err)
 			log.Printf("Failed to restart settings-service: %v, output: %s", err, string(output))
 		} else {
-			umsLog.Logf("service", "Restarted settings-service")
+			logger.Logf("settings-service", "restarted")
 			log.Println("Successfully restarted settings-service")
 		}
 	}
 
-	umsLog.Log("Processing complete")
-
-	logPath := filepath.Join(mountPoint, "ums_log.txt")
-	if err := umsLog.WriteToFile(logPath); err != nil {
-		log.Printf("Error writing UMS log: %v", err)
+	if err := logger.WriteToFile(filepath.Join(mountPoint, "ums_log.txt")); err != nil {
+		log.Printf("Error writing log file: %v", err)
 	}
 
 	if err := s.diskMgr.CleanDrive(); err != nil {
@@ -349,6 +350,7 @@ func (s *Service) switchToNormal(prevMode string) error {
 	}
 
 	s.umsModeType = ""
+	s.setStep("")
 	s.setStatus("idle")
 	log.Println("Switched to normal mode and processed files")
 
@@ -493,5 +495,11 @@ func (s *Service) setLEDs(p ledPattern) {
 func (s *Service) setStatus(status string) {
 	if err := s.publisher.Set("status", status, ipc.Sync()); err != nil {
 		log.Printf("Error publishing usb status %q: %v", status, err)
+	}
+}
+
+func (s *Service) setStep(step string) {
+	if err := s.publisher.Set("step", step, ipc.Sync()); err != nil {
+		log.Printf("Error publishing usb step %q: %v", step, err)
 	}
 }
