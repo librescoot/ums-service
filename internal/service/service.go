@@ -18,6 +18,8 @@ import (
 	"github.com/librescoot/ums-service/pkg/diagnostics"
 	"github.com/librescoot/ums-service/pkg/disk"
 	"github.com/librescoot/ums-service/pkg/maps"
+	"github.com/librescoot/ums-service/pkg/rpm"
+	"github.com/librescoot/ums-service/pkg/scripts"
 	"github.com/librescoot/ums-service/pkg/settings"
 	"github.com/librescoot/ums-service/pkg/umslog"
 	"github.com/librescoot/ums-service/pkg/update"
@@ -38,6 +40,8 @@ type Service struct {
 	mapsUpdater  *maps.Updater
 	wgManager    *wireguard.Manager
 	diagnostics  *diagnostics.Collector
+	rpmInstaller *rpm.Installer
+	scriptRunner *scripts.Runner
 	mu           sync.Mutex
 	detachCount  int
 	umsModeType  string
@@ -66,6 +70,8 @@ func New(cfg *config.Config) (*Service, error) {
 	wgManager := wireguard.New()
 
 	updateLdr := update.New(client, dbcInterface)
+	rpmInstaller := rpm.New(dbcInterface)
+	scriptRunner := scripts.New(dbcInterface)
 
 	svc := &Service{
 		config:       cfg,
@@ -80,6 +86,8 @@ func New(cfg *config.Config) (*Service, error) {
 		mapsUpdater:  mapsUpdater,
 		wgManager:    wgManager,
 		diagnostics:  diagnostics.New(),
+		rpmInstaller: rpmInstaller,
+		scriptRunner: scriptRunner,
 	}
 
 	svc.watcher.OnField("mode", svc.handleModeChange)
@@ -197,6 +205,14 @@ func (s *Service) switchToUMS(mode string) error {
 
 	s.diagnostics.CollectToUSB(mountPoint)
 
+	if err := s.rpmInstaller.PrepareUSB(mountPoint); err != nil {
+		log.Printf("Error preparing rpms directory: %v", err)
+	}
+
+	if err := s.scriptRunner.PrepareUSB(mountPoint); err != nil {
+		log.Printf("Error preparing scripts directory: %v", err)
+	}
+
 	if err := s.diskMgr.Unmount(); err != nil {
 		s.setStatus("idle")
 		return fmt.Errorf("failed to unmount drive: %w", err)
@@ -291,6 +307,13 @@ func (s *Service) switchToNormal(prevMode string) error {
 		umsLog.Logf("maps", "Complete")
 	}
 
+	if err := s.rpmInstaller.ProcessRPMs(mountPoint); err != nil {
+		log.Printf("Error processing RPMs: %v", err)
+	}
+	if err := s.scriptRunner.ProcessScripts(mountPoint); err != nil {
+		log.Printf("Error processing scripts: %v", err)
+	}
+
 	if settingsChanged || wgChanged {
 		umsLog.Log("Configuration changed, restarting settings-service")
 		log.Println("Configuration changed, restarting settings-service")
@@ -356,6 +379,22 @@ func (s *Service) checkIfDBCNeeded(mountPoint string) bool {
 				}
 			}
 		}
+	}
+
+	dbcRPMDir := filepath.Join(mountPoint, "rpms", "dbc")
+	if entries, err := os.ReadDir(dbcRPMDir); err == nil {
+		for _, entry := range entries {
+			if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".rpm") {
+				log.Println("Found DBC RPM files, DBC needed")
+				return true
+			}
+		}
+	}
+
+	dbcScript := filepath.Join(mountPoint, "scripts", "dbc.sh")
+	if _, err := os.Stat(dbcScript); err == nil {
+		log.Println("Found DBC script, DBC needed")
+		return true
 	}
 
 	log.Println("No DBC operations needed")
