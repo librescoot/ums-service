@@ -15,9 +15,11 @@ import (
 	ipc "github.com/librescoot/redis-ipc"
 	"github.com/librescoot/ums-service/pkg/config"
 	"github.com/librescoot/ums-service/pkg/dbc"
+	"github.com/librescoot/ums-service/pkg/diagnostics"
 	"github.com/librescoot/ums-service/pkg/disk"
 	"github.com/librescoot/ums-service/pkg/maps"
 	"github.com/librescoot/ums-service/pkg/settings"
+	"github.com/librescoot/ums-service/pkg/umslog"
 	"github.com/librescoot/ums-service/pkg/update"
 	"github.com/librescoot/ums-service/pkg/usb"
 	"github.com/librescoot/ums-service/pkg/wireguard"
@@ -35,6 +37,7 @@ type Service struct {
 	updateLdr    *update.Loader
 	mapsUpdater  *maps.Updater
 	wgManager    *wireguard.Manager
+	diagnostics  *diagnostics.Collector
 	mu           sync.Mutex
 	detachCount  int
 	umsModeType  string
@@ -76,6 +79,7 @@ func New(cfg *config.Config) (*Service, error) {
 		updateLdr:    updateLdr,
 		mapsUpdater:  mapsUpdater,
 		wgManager:    wgManager,
+		diagnostics:  diagnostics.New(),
 	}
 
 	svc.watcher.OnField("mode", svc.handleModeChange)
@@ -191,6 +195,8 @@ func (s *Service) switchToUMS(mode string) error {
 		log.Printf("Error copying wireguard configs to USB: %v", err)
 	}
 
+	s.diagnostics.CollectToUSB(mountPoint)
+
 	if err := s.diskMgr.Unmount(); err != nil {
 		s.setStatus("idle")
 		return fmt.Errorf("failed to unmount drive: %w", err)
@@ -233,44 +239,76 @@ func (s *Service) switchToNormal(prevMode string) error {
 
 	ctx := context.Background()
 	mountPoint := s.diskMgr.GetMountPoint()
+	umsLog := umslog.New()
+
+	umsLog.Log("Starting USB file processing")
 
 	needDBC := s.checkIfDBCNeeded(mountPoint)
 
 	if needDBC {
+		umsLog.Log("DBC needed, enabling...")
 		if err := s.dbcInterface.Enable(ctx); err != nil {
+			umsLog.Error("dbc", "Failed to enable: %v", err)
 			log.Printf("Warning: failed to enable DBC: %v", err)
+		} else {
+			umsLog.Logf("dbc", "Enabled successfully")
 		}
 	}
 
 	settingsChanged := false
+	umsLog.Logf("settings", "Processing settings...")
 	if changed, err := s.settingsLdr.CopyFromUSB(mountPoint); err != nil {
+		umsLog.Error("settings", "Failed: %v", err)
 		log.Printf("Error processing settings: %v", err)
 	} else {
+		umsLog.Logf("settings", "Settings synced (changed: %v)", changed)
 		settingsChanged = changed
 	}
 
 	wgChanged := false
+	umsLog.Logf("wireguard", "Processing configs...")
 	if changed, err := s.wgManager.SyncFromUSB(mountPoint); err != nil {
+		umsLog.Error("wireguard", "Failed: %v", err)
 		log.Printf("Error processing wireguard configs: %v", err)
 	} else {
+		umsLog.Logf("wireguard", "Configs synced (changed: %v)", changed)
 		wgChanged = changed
 	}
 
+	umsLog.Logf("updates", "Processing system updates...")
 	if err := s.updateLdr.ProcessUpdates(mountPoint); err != nil {
+		umsLog.Error("updates", "Failed: %v", err)
 		log.Printf("Error processing updates: %v", err)
+	} else {
+		umsLog.Logf("updates", "Complete")
 	}
+
+	umsLog.Logf("maps", "Processing maps...")
 	if err := s.mapsUpdater.ProcessMaps(mountPoint); err != nil {
+		umsLog.Error("maps", "Failed: %v", err)
 		log.Printf("Error processing maps: %v", err)
+	} else {
+		umsLog.Logf("maps", "Complete")
 	}
 
 	if settingsChanged || wgChanged {
+		umsLog.Log("Configuration changed, restarting settings-service")
 		log.Println("Configuration changed, restarting settings-service")
 		cmd := exec.Command("systemctl", "restart", "settings-service")
 		if output, err := cmd.CombinedOutput(); err != nil {
+			umsLog.Error("service", "Failed to restart settings-service: %v", err)
 			log.Printf("Failed to restart settings-service: %v, output: %s", err, string(output))
 		} else {
+			umsLog.Logf("service", "Restarted settings-service")
 			log.Println("Successfully restarted settings-service")
 		}
+	}
+
+	umsLog.Log("Processing complete")
+
+	logPath := filepath.Join(mountPoint, "ums_log.txt")
+	if err := umsLog.WriteToFile(logPath); err != nil {
+		log.Printf("Error writing UMS log: %v", err)
 	}
 
 	if err := s.diskMgr.CleanDrive(); err != nil {
