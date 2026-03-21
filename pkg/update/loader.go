@@ -61,11 +61,11 @@ func (l *Loader) ProcessUpdates(usbMountPath string) error {
 
 		srcPath := filepath.Join(updateDir, filename)
 
-		if strings.Contains(filename, "librescoot-mdb") {
+		if strings.Contains(filename, "-mdb") {
 			if err := l.processMDBUpdate(srcPath); err != nil {
 				return fmt.Errorf("failed to process MDB update: %w", err)
 			}
-		} else if strings.Contains(filename, "librescoot-dbc") {
+		} else if strings.Contains(filename, "-dbc") {
 			if err := l.processDBCUpdate(srcPath); err != nil {
 				return fmt.Errorf("failed to process DBC update: %w", err)
 			}
