@@ -5,6 +5,8 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+
+	"github.com/BurntSushi/toml"
 )
 
 type Loader struct {
@@ -49,6 +51,12 @@ func (l *Loader) CopyFromUSB(usbMountPath string) (bool, error) {
 	input, err := os.ReadFile(srcPath)
 	if err != nil {
 		return false, fmt.Errorf("failed to read settings from USB: %w", err)
+	}
+
+	var dummy map[string]interface{}
+	if err := toml.Unmarshal(input, &dummy); err != nil {
+		log.Printf("Invalid TOML in settings.toml on USB drive: %v — skipping", err)
+		return false, nil
 	}
 
 	// Check if content changed
