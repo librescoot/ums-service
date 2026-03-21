@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 )
 
+const tmpSuffix = ".tmp"
+
 type Manager struct {
 	driveFile   string
 	driveSize   int64
@@ -23,33 +25,58 @@ func NewManager(driveFile string, driveSize int64) *Manager {
 }
 
 func (m *Manager) Initialize() error {
+	m.cleanupTempFile()
+
 	if err := m.ensureDriveExists(); err != nil {
 		return fmt.Errorf("failed to ensure drive exists: %w", err)
 	}
 	return nil
 }
 
+func (m *Manager) cleanupTempFile() {
+	tmpFile := m.driveFile + tmpSuffix
+	if _, err := os.Stat(tmpFile); err == nil {
+		log.Printf("Removing leftover temp drive file %s", tmpFile)
+		os.Remove(tmpFile)
+	}
+}
+
 func (m *Manager) ensureDriveExists() error {
 	if _, err := os.Stat(m.driveFile); os.IsNotExist(err) {
-		log.Printf("Creating virtual USB drive at %s", m.driveFile)
-		
-		if err := os.MkdirAll(filepath.Dir(m.driveFile), 0755); err != nil {
-			return fmt.Errorf("failed to create directory: %w", err)
-		}
-
-		if err := m.createDriveFile(); err != nil {
-			return fmt.Errorf("failed to create drive file: %w", err)
-		}
-
-		if err := m.formatDrive(); err != nil {
-			return fmt.Errorf("failed to format drive: %w", err)
-		}
+		return m.createAndFormatDrive()
 	}
 	return nil
 }
 
-func (m *Manager) createDriveFile() error {
-	cmd := exec.Command("dd", "if=/dev/zero", fmt.Sprintf("of=%s", m.driveFile), 
+func (m *Manager) createAndFormatDrive() error {
+	log.Printf("Creating virtual USB drive at %s", m.driveFile)
+	tmpFile := m.driveFile + tmpSuffix
+
+	if err := os.MkdirAll(filepath.Dir(m.driveFile), 0755); err != nil {
+		return fmt.Errorf("failed to create directory: %w", err)
+	}
+
+	if err := m.createDriveFile(tmpFile); err != nil {
+		os.Remove(tmpFile)
+		return fmt.Errorf("failed to create drive file: %w", err)
+	}
+
+	if err := m.formatDrive(tmpFile); err != nil {
+		os.Remove(tmpFile)
+		return fmt.Errorf("failed to format drive: %w", err)
+	}
+
+	if err := os.Rename(tmpFile, m.driveFile); err != nil {
+		os.Remove(tmpFile)
+		return fmt.Errorf("failed to move drive file into place: %w", err)
+	}
+
+	log.Printf("Virtual USB drive created successfully")
+	return nil
+}
+
+func (m *Manager) createDriveFile(path string) error {
+	cmd := exec.Command("dd", "if=/dev/zero", fmt.Sprintf("of=%s", path),
 		"bs=1M", fmt.Sprintf("count=%d", m.driveSize/(1024*1024)))
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -58,8 +85,8 @@ func (m *Manager) createDriveFile() error {
 	return nil
 }
 
-func (m *Manager) formatDrive() error {
-	cmd := exec.Command("mkfs.fat", "-F", "32", m.driveFile)
+func (m *Manager) formatDrive(path string) error {
+	cmd := exec.Command("mkfs.fat", "-F", "32", path)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("mkfs.fat failed: %v, output: %s", err, string(output))
@@ -67,7 +94,24 @@ func (m *Manager) formatDrive() error {
 	return nil
 }
 
+func (m *Manager) checkFilesystem() error {
+	cmd := exec.Command("fsck.fat", "-n", m.driveFile)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("fsck.fat failed: %v, output: %s", err, string(output))
+	}
+	return nil
+}
+
 func (m *Manager) Mount() error {
+	if err := m.checkFilesystem(); err != nil {
+		log.Printf("Filesystem check failed: %v — recreating drive", err)
+		os.Remove(m.driveFile)
+		if err := m.createAndFormatDrive(); err != nil {
+			return fmt.Errorf("failed to recreate drive after corruption: %w", err)
+		}
+	}
+
 	if err := os.MkdirAll(m.mountPoint, 0755); err != nil {
 		return fmt.Errorf("failed to create mount point: %w", err)
 	}
