@@ -16,6 +16,11 @@ type Updater struct {
 	dbcInterface   *dbc.Interface
 }
 
+func isValhallaTilesArchive(filename string) bool {
+	return strings.HasSuffix(filename, "tiles.tar") ||
+		(strings.HasPrefix(filename, "valhalla_tiles_") && strings.HasSuffix(filename, ".tar"))
+}
+
 func New(dbcInterface *dbc.Interface) *Updater {
 	return &Updater{
 		dbcMapsDir:     "/data/maps",
@@ -60,7 +65,7 @@ func (u *Updater) ProcessMaps(usbMountPath string) error {
 		filename := entry.Name()
 		if strings.HasSuffix(filename, ".mbtiles") {
 			mbtilesFile = filepath.Join(mapsDir, filename)
-		} else if strings.HasSuffix(filename, "tiles.tar") {
+		} else if isValhallaTilesArchive(filename) {
 			tilesFile = filepath.Join(mapsDir, filename)
 		}
 	}

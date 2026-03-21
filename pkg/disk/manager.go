@@ -124,10 +124,15 @@ func (m *Manager) unmountDrive(mountPoint string) error {
 }
 
 func (m *Manager) cleanDrive(mountPoint string) error {
-	cmd := exec.Command("find", mountPoint, "-mindepth", "1", "-delete")
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("find/delete failed: %v, output: %s", err, string(output))
+	cmds := [][]string{
+		{"find", mountPoint, "-mindepth", "1", "-type", "f", "-not", "-name", "ums_log.txt", "-delete"},
+		{"find", mountPoint, "-mindepth", "1", "-type", "d", "-empty", "-delete"},
+	}
+	for _, args := range cmds {
+		cmd := exec.Command(args[0], args[1:]...)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("clean failed: %v, output: %s", err, string(output))
+		}
 	}
 	return nil
 }

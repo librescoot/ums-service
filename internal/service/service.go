@@ -15,9 +15,13 @@ import (
 	ipc "github.com/librescoot/redis-ipc"
 	"github.com/librescoot/ums-service/pkg/config"
 	"github.com/librescoot/ums-service/pkg/dbc"
+	"github.com/librescoot/ums-service/pkg/diagnostics"
 	"github.com/librescoot/ums-service/pkg/disk"
 	"github.com/librescoot/ums-service/pkg/maps"
+	"github.com/librescoot/ums-service/pkg/rpm"
+	"github.com/librescoot/ums-service/pkg/scripts"
 	"github.com/librescoot/ums-service/pkg/settings"
+	"github.com/librescoot/ums-service/pkg/umslog"
 	"github.com/librescoot/ums-service/pkg/update"
 	"github.com/librescoot/ums-service/pkg/usb"
 	"github.com/librescoot/ums-service/pkg/wireguard"
@@ -35,6 +39,9 @@ type Service struct {
 	updateLdr    *update.Loader
 	mapsUpdater  *maps.Updater
 	wgManager    *wireguard.Manager
+	diagnostics  *diagnostics.Collector
+	rpmInstaller *rpm.Installer
+	scriptRunner *scripts.Runner
 	mu           sync.Mutex
 	detachCount  int
 	umsModeType  string
@@ -63,6 +70,8 @@ func New(cfg *config.Config) (*Service, error) {
 	wgManager := wireguard.New()
 
 	updateLdr := update.New(client, dbcInterface)
+	rpmInstaller := rpm.New(dbcInterface)
+	scriptRunner := scripts.New(dbcInterface)
 
 	svc := &Service{
 		config:       cfg,
@@ -76,6 +85,9 @@ func New(cfg *config.Config) (*Service, error) {
 		updateLdr:    updateLdr,
 		mapsUpdater:  mapsUpdater,
 		wgManager:    wgManager,
+		diagnostics:  diagnostics.New(),
+		rpmInstaller: rpmInstaller,
+		scriptRunner: scriptRunner,
 	}
 
 	svc.watcher.OnField("mode", svc.handleModeChange)
@@ -165,6 +177,10 @@ func (s *Service) handleModeChange(mode string) error {
 func (s *Service) switchToUMS(mode string) error {
 	s.setStatus("preparing")
 
+	if _, err := s.client.Del("usb:log"); err != nil {
+		log.Printf("Warning: failed to clear usb:log: %v", err)
+	}
+
 	if err := s.diskMgr.Mount(); err != nil {
 		s.setStatus("idle")
 		return fmt.Errorf("failed to mount drive: %w", err)
@@ -189,6 +205,16 @@ func (s *Service) switchToUMS(mode string) error {
 	}
 	if err := s.wgManager.CopyToUSB(mountPoint); err != nil {
 		log.Printf("Error copying wireguard configs to USB: %v", err)
+	}
+
+	s.diagnostics.CollectToUSB(mountPoint)
+
+	if err := s.rpmInstaller.PrepareUSB(mountPoint); err != nil {
+		log.Printf("Error preparing rpms directory: %v", err)
+	}
+
+	if err := s.scriptRunner.PrepareUSB(mountPoint); err != nil {
+		log.Printf("Error preparing scripts directory: %v", err)
 	}
 
 	if err := s.diskMgr.Unmount(); err != nil {
@@ -220,6 +246,7 @@ func (s *Service) switchToNormal(prevMode string) error {
 	}
 
 	if prevMode != "ums" {
+		s.setStep("")
 		s.setStatus("idle")
 		return nil
 	}
@@ -227,50 +254,87 @@ func (s *Service) switchToNormal(prevMode string) error {
 	s.setStatus("processing")
 
 	if err := s.diskMgr.Mount(); err != nil {
+		s.setStep("")
 		s.setStatus("idle")
 		return fmt.Errorf("failed to mount drive: %w", err)
 	}
 
 	ctx := context.Background()
 	mountPoint := s.diskMgr.GetMountPoint()
+	logger := umslog.New(s.client)
 
 	needDBC := s.checkIfDBCNeeded(mountPoint)
 
 	if needDBC {
 		if err := s.dbcInterface.Enable(ctx); err != nil {
+			logger.Error("dbc", "Failed to enable: %v", err)
 			log.Printf("Warning: failed to enable DBC: %v", err)
+		} else {
+			logger.Logf("dbc", "enabled")
 		}
 	}
 
+	s.setStep("settings")
 	settingsChanged := false
 	if changed, err := s.settingsLdr.CopyFromUSB(mountPoint); err != nil {
+		logger.Error("settings", "%v", err)
 		log.Printf("Error processing settings: %v", err)
 	} else {
+		logger.Logf("settings", "done (changed=%v)", changed)
 		settingsChanged = changed
 	}
 
+	s.setStep("wireguard")
 	wgChanged := false
 	if changed, err := s.wgManager.SyncFromUSB(mountPoint); err != nil {
+		logger.Error("wireguard", "%v", err)
 		log.Printf("Error processing wireguard configs: %v", err)
 	} else {
+		logger.Logf("wireguard", "done (changed=%v)", changed)
 		wgChanged = changed
 	}
 
+	s.setStep("updates")
 	if err := s.updateLdr.ProcessUpdates(mountPoint); err != nil {
+		logger.Error("updates", "%v", err)
 		log.Printf("Error processing updates: %v", err)
+	} else {
+		logger.Logf("updates", "done")
 	}
+
+	s.setStep("maps")
 	if err := s.mapsUpdater.ProcessMaps(mountPoint); err != nil {
+		logger.Error("maps", "%v", err)
 		log.Printf("Error processing maps: %v", err)
+	} else {
+		logger.Logf("maps", "done")
+	}
+
+	if err := s.rpmInstaller.ProcessRPMs(mountPoint); err != nil {
+		logger.Error("rpms", "%v", err)
+		log.Printf("Error processing RPMs: %v", err)
+	} else {
+		logger.Logf("rpms", "done")
+	}
+	if err := s.scriptRunner.ProcessScripts(mountPoint); err != nil {
+		logger.Error("scripts", "%v", err)
+		log.Printf("Error processing scripts: %v", err)
 	}
 
 	if settingsChanged || wgChanged {
 		log.Println("Configuration changed, restarting settings-service")
 		cmd := exec.Command("systemctl", "restart", "settings-service")
 		if output, err := cmd.CombinedOutput(); err != nil {
+			logger.Error("settings-service", "restart failed: %v", err)
 			log.Printf("Failed to restart settings-service: %v, output: %s", err, string(output))
 		} else {
+			logger.Logf("settings-service", "restarted")
 			log.Println("Successfully restarted settings-service")
 		}
+	}
+
+	if err := logger.WriteToFile(filepath.Join(mountPoint, "ums_log.txt")); err != nil {
+		log.Printf("Error writing log file: %v", err)
 	}
 
 	if err := s.diskMgr.CleanDrive(); err != nil {
@@ -288,6 +352,7 @@ func (s *Service) switchToNormal(prevMode string) error {
 	}
 
 	s.umsModeType = ""
+	s.setStep("")
 	s.setStatus("idle")
 	log.Println("Switched to normal mode and processed files")
 
@@ -310,12 +375,30 @@ func (s *Service) checkIfDBCNeeded(mountPoint string) bool {
 		for _, entry := range entries {
 			if !entry.IsDir() {
 				filename := entry.Name()
-				if strings.HasSuffix(filename, ".mbtiles") || strings.HasSuffix(filename, "tiles.tar") {
+				if strings.HasSuffix(filename, ".mbtiles") ||
+					strings.HasSuffix(filename, "tiles.tar") ||
+					(strings.HasPrefix(filename, "valhalla_tiles_") && strings.HasSuffix(filename, ".tar")) {
 					log.Println("Found map files, DBC needed")
 					return true
 				}
 			}
 		}
+	}
+
+	dbcRPMDir := filepath.Join(mountPoint, "rpms", "dbc")
+	if entries, err := os.ReadDir(dbcRPMDir); err == nil {
+		for _, entry := range entries {
+			if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".rpm") {
+				log.Println("Found DBC RPM files, DBC needed")
+				return true
+			}
+		}
+	}
+
+	dbcScript := filepath.Join(mountPoint, "scripts", "dbc.sh")
+	if _, err := os.Stat(dbcScript); err == nil {
+		log.Println("Found DBC script, DBC needed")
+		return true
 	}
 
 	log.Println("No DBC operations needed")
@@ -414,5 +497,11 @@ func (s *Service) setLEDs(p ledPattern) {
 func (s *Service) setStatus(status string) {
 	if err := s.publisher.Set("status", status, ipc.Sync()); err != nil {
 		log.Printf("Error publishing usb status %q: %v", status, err)
+	}
+}
+
+func (s *Service) setStep(step string) {
+	if err := s.publisher.Set("step", step, ipc.Sync()); err != nil {
+		log.Printf("Error publishing usb step %q: %v", step, err)
 	}
 }
