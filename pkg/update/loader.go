@@ -22,7 +22,7 @@ type Loader struct {
 func New(client *ipc.Client, dbcInterface *dbc.Interface) *Loader {
 	return &Loader{
 		otaDir:       "/data/ota",
-		dbcOtaDir:    "/data/ota",
+		dbcOtaDir:    "/data/ota/dbc",
 		client:       client,
 		dbcInterface: dbcInterface,
 	}
