@@ -1,6 +1,7 @@
 package scripts
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
@@ -86,8 +87,8 @@ func (r *Runner) runDBCScript(scriptsDir string) {
 	log.Println("Running DBC script")
 
 	remotePath := "/tmp/dbc.sh"
-	if err := r.dbcInterface.CopyFile(srcPath, remotePath); err != nil {
-		log.Printf("Failed to copy dbc.sh to DBC: %v", err)
+	if err := r.dbcInterface.TransferFile(context.Background(), srcPath, remotePath, nil); err != nil {
+		log.Printf("Failed to transfer dbc.sh to DBC: %v", err)
 		return
 	}
 

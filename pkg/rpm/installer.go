@@ -1,6 +1,7 @@
 package rpm
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
@@ -104,8 +105,8 @@ func (i *Installer) processDBCRPMs(usbMountPath string) error {
 		filename := filepath.Base(localPath)
 		remotePath := fmt.Sprintf("%s/%s", dbcRPMDir, filename)
 
-		if err := i.dbcInterface.CopyFile(localPath, remotePath); err != nil {
-			return fmt.Errorf("failed to copy %s to DBC: %w", filename, err)
+		if err := i.dbcInterface.TransferFile(context.Background(), localPath, remotePath, nil); err != nil {
+			return fmt.Errorf("failed to transfer %s to DBC: %w", filename, err)
 		}
 		remoteFiles = append(remoteFiles, remotePath)
 	}

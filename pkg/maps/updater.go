@@ -1,6 +1,7 @@
 package maps
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
@@ -99,9 +100,9 @@ func (u *Updater) processMBTiles(localPath string) error {
 
 	remotePath := filepath.Join(u.dbcMapsDir, "map.mbtiles")
 
-	// Copy mbtiles file to DBC
-	if err := u.dbcInterface.CopyFile(localPath, remotePath); err != nil {
-		return fmt.Errorf("failed to copy mbtiles to DBC: %w", err)
+	// Upload mbtiles file to DBC (HTTP PUT with SCP fallback)
+	if err := u.dbcInterface.TransferFile(context.Background(), localPath, remotePath, nil); err != nil {
+		return fmt.Errorf("failed to transfer mbtiles to DBC: %w", err)
 	}
 
 	log.Printf("Successfully copied mbtiles to DBC at %s", remotePath)
@@ -116,9 +117,9 @@ func (u *Updater) processTilesTar(localPath string) error {
 
 	remotePath := filepath.Join(u.dbcValhallaDir, "tiles.tar")
 
-	// Copy tiles.tar file to DBC
-	if err := u.dbcInterface.CopyFile(localPath, remotePath); err != nil {
-		return fmt.Errorf("failed to copy tiles.tar to DBC: %w", err)
+	// Upload tiles.tar file to DBC (HTTP PUT with SCP fallback)
+	if err := u.dbcInterface.TransferFile(context.Background(), localPath, remotePath, nil); err != nil {
+		return fmt.Errorf("failed to transfer tiles.tar to DBC: %w", err)
 	}
 
 	log.Printf("Successfully copied tiles.tar to DBC at %s", remotePath)

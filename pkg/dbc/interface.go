@@ -58,7 +58,13 @@ func (i *Interface) Enable(ctx context.Context) error {
 			if i.isReachable() {
 				i.enabled = true
 				log.Println("DBC is now reachable")
-				return i.startHTTPServer()
+				if err := i.startHTTPServer(); err != nil {
+					return err
+				}
+				if err := i.startUploadServer(ctx); err != nil {
+					log.Printf("DBC upload server failed to start, uploads will fall back to SCP: %v", err)
+				}
+				return nil
 			}
 		}
 	}
@@ -70,6 +76,8 @@ func (i *Interface) Disable() error {
 	}
 
 	log.Println("Disabling DBC interface...")
+
+	i.stopUploadServer()
 
 	if i.httpServer != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

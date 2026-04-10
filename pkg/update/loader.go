@@ -1,6 +1,7 @@
 package update
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -133,8 +134,8 @@ func (l *Loader) processDBCUpdate(srcPath string) error {
 		return fmt.Errorf("failed to create remote OTA directory: %w", err)
 	}
 
-	if err := l.dbcInterface.CopyFile(srcPath, remotePath); err != nil {
-		return fmt.Errorf("failed to copy update to DBC: %w", err)
+	if err := l.dbcInterface.TransferFile(context.Background(), srcPath, remotePath, nil); err != nil {
+		return fmt.Errorf("failed to transfer update to DBC: %w", err)
 	}
 
 	log.Printf("Copied DBC update to %s", remotePath)
