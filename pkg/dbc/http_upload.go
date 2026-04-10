@@ -153,8 +153,9 @@ func (i *Interface) stopUploadServer() {
 
 // ProgressFunc is called with (bytesSent, totalBytes) as an upload advances.
 // totalBytes is the full file size; implementations should be cheap as this
-// fires after every chunk flush.
-type ProgressFunc func(bytesSent, totalBytes int64)
+// fires after every chunk flush. Declared as a type alias so callers can
+// pass a bare `func(int64, int64)` (e.g. from umslog) without conversion.
+type ProgressFunc = func(bytesSent, totalBytes int64)
 
 // progressReader wraps an io.Reader and fires progressFn after each read.
 type progressReader struct {

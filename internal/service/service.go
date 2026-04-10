@@ -295,31 +295,36 @@ func (s *Service) switchToNormal(prevMode string) error {
 	}
 
 	s.setStep("updates")
-	if err := s.updateLdr.ProcessUpdates(ctx, s.config.MenderTransferTimeout, mountPoint); err != nil {
+	if err := s.updateLdr.ProcessUpdates(ctx, s.config.MenderTransferTimeout, logger, mountPoint); err != nil {
 		logger.Error("updates", "%v", err)
 		log.Printf("Error processing updates: %v", err)
 	} else {
 		logger.Logf("updates", "done")
 	}
+	logger.ClearProgress()
 
 	s.setStep("maps")
-	if err := s.mapsUpdater.ProcessMaps(ctx, s.config.MapTransferTimeout, mountPoint); err != nil {
+	if err := s.mapsUpdater.ProcessMaps(ctx, s.config.MapTransferTimeout, logger, mountPoint); err != nil {
 		logger.Error("maps", "%v", err)
 		log.Printf("Error processing maps: %v", err)
 	} else {
 		logger.Logf("maps", "done")
 	}
+	logger.ClearProgress()
 
-	if err := s.rpmInstaller.ProcessRPMs(ctx, s.config.RPMTransferTimeout, mountPoint); err != nil {
+	if err := s.rpmInstaller.ProcessRPMs(ctx, s.config.RPMTransferTimeout, logger, mountPoint); err != nil {
 		logger.Error("rpms", "%v", err)
 		log.Printf("Error processing RPMs: %v", err)
 	} else {
 		logger.Logf("rpms", "done")
 	}
-	if err := s.scriptRunner.ProcessScripts(ctx, s.config.ScriptTransferTimeout, mountPoint); err != nil {
+	logger.ClearProgress()
+
+	if err := s.scriptRunner.ProcessScripts(ctx, s.config.ScriptTransferTimeout, logger, mountPoint); err != nil {
 		logger.Error("scripts", "%v", err)
 		log.Printf("Error processing scripts: %v", err)
 	}
+	logger.ClearProgress()
 
 	if settingsChanged || wgChanged {
 		log.Println("Configuration changed, restarting settings-service")

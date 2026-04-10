@@ -12,6 +12,7 @@ import (
 
 	ipc "github.com/librescoot/redis-ipc"
 	"github.com/librescoot/ums-service/pkg/dbc"
+	"github.com/librescoot/ums-service/pkg/umslog"
 )
 
 type Loader struct {
@@ -39,7 +40,7 @@ func (l *Loader) PrepareUSB(usbMountPath string) error {
 	return nil
 }
 
-func (l *Loader) ProcessUpdates(ctx context.Context, perFileTimeout time.Duration, usbMountPath string) error {
+func (l *Loader) ProcessUpdates(ctx context.Context, perFileTimeout time.Duration, logger *umslog.Logger, usbMountPath string) error {
 	updateDir := filepath.Join(usbMountPath, "system-update")
 
 	entries, err := os.ReadDir(updateDir)
@@ -68,7 +69,7 @@ func (l *Loader) ProcessUpdates(ctx context.Context, perFileTimeout time.Duratio
 				return fmt.Errorf("failed to process MDB update: %w", err)
 			}
 		} else if strings.Contains(filename, "-dbc") {
-			if err := l.processDBCUpdate(ctx, perFileTimeout, srcPath); err != nil {
+			if err := l.processDBCUpdate(ctx, perFileTimeout, logger, srcPath); err != nil {
 				return fmt.Errorf("failed to process DBC update: %w", err)
 			}
 		}
@@ -121,7 +122,7 @@ func copyFile(src, dst string) error {
 	return out.Sync()
 }
 
-func (l *Loader) processDBCUpdate(ctx context.Context, timeout time.Duration, srcPath string) error {
+func (l *Loader) processDBCUpdate(ctx context.Context, timeout time.Duration, logger *umslog.Logger, srcPath string) error {
 	filename := filepath.Base(srcPath)
 	log.Printf("Processing DBC update: %s", filename)
 
@@ -138,7 +139,12 @@ func (l *Loader) processDBCUpdate(ctx context.Context, timeout time.Duration, sr
 		return fmt.Errorf("failed to create remote OTA directory: %w", err)
 	}
 
-	if err := l.dbcInterface.TransferFile(opCtx, srcPath, remotePath, nil); err != nil {
+	var progress dbc.ProgressFunc
+	if logger != nil {
+		progress = logger.ProgressCallback(filename)
+		defer logger.ClearProgress()
+	}
+	if err := l.dbcInterface.TransferFile(opCtx, srcPath, remotePath, progress); err != nil {
 		return fmt.Errorf("failed to transfer update to DBC: %w", err)
 	}
 

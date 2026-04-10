@@ -14,13 +14,22 @@ import (
 	ipc "github.com/librescoot/redis-ipc"
 )
 
+// heartbeatInterval controls how often we re-publish start-dbc to keep
+// vehicle-service's watchdog fed. Must be comfortably less than the
+// vehicle-service `dbcUpdateTimeout` (currently 15 min on production,
+// 45 min in local source). 5 min gives three heartbeats per watchdog
+// window and leaves slack for transient redis delays.
+const heartbeatInterval = 5 * time.Minute
+
 type Interface struct {
-	ip         string
-	port       int
-	dataDir    string
-	httpServer *http.Server
-	enabled    bool
-	client     *ipc.Client
+	ip              string
+	port            int
+	dataDir         string
+	httpServer      *http.Server
+	enabled         bool
+	client          *ipc.Client
+	heartbeatCancel context.CancelFunc
+	heartbeatDone   chan struct{}
 }
 
 func New(dataDir string, client *ipc.Client) *Interface {
@@ -77,10 +86,51 @@ func (i *Interface) Enable(ctx context.Context) error {
 				if err := i.startUploadServer(ctx); err != nil {
 					log.Printf("DBC upload server failed to start, uploads will fall back to SCP: %v", err)
 				}
+				i.startHeartbeat()
 				return nil
 			}
 		}
 	}
+}
+
+// startHeartbeat launches a goroutine that re-sends start-dbc every
+// heartbeatInterval so vehicle-service's watchdog gets fed during long
+// operations. Safe because start-dbc is idempotent — same handler just
+// resets the timer and re-arms the inhibitor.
+func (i *Interface) startHeartbeat() {
+	hbCtx, cancel := context.WithCancel(context.Background())
+	i.heartbeatCancel = cancel
+	i.heartbeatDone = make(chan struct{})
+	go func() {
+		defer close(i.heartbeatDone)
+		ticker := time.NewTicker(heartbeatInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-hbCtx.Done():
+				return
+			case <-ticker.C:
+				if _, err := i.client.LPush("scooter:update", "start-dbc"); err != nil {
+					log.Printf("heartbeat: failed to refresh DBC update lock: %v", err)
+				} else {
+					log.Printf("heartbeat: refreshed DBC update lock")
+				}
+			}
+		}
+	}()
+}
+
+// stopHeartbeat cancels the heartbeat goroutine and waits for it to
+// exit. Must run before releaseUpdateLock so a racing heartbeat can't
+// re-claim the lock after we've already released it.
+func (i *Interface) stopHeartbeat() {
+	if i.heartbeatCancel == nil {
+		return
+	}
+	i.heartbeatCancel()
+	<-i.heartbeatDone
+	i.heartbeatCancel = nil
+	i.heartbeatDone = nil
 }
 
 // releaseUpdateLock sends complete-dbc so vehicle-service clears
@@ -99,7 +149,13 @@ func (i *Interface) Disable() error {
 
 	log.Println("Disabling DBC interface...")
 
-	// Release the update lock first so any follow-up dashboard:off (or
+	// Stop the heartbeat FIRST, then release the lock. Reversing the
+	// order would race: a heartbeat tick between releaseUpdateLock and
+	// stopHeartbeat could re-claim the DBC update lock after we told
+	// vehicle-service we were done.
+	i.stopHeartbeat()
+
+	// Release the update lock so any follow-up dashboard:off (or
 	// deferred FSM transitions) are allowed to proceed. Deferred
 	// behavior matters: if the user locked the scooter mid-update,
 	// vehicle-service parked deferredDashboardPower and complete-dbc

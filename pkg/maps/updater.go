@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/librescoot/ums-service/pkg/dbc"
+	"github.com/librescoot/ums-service/pkg/umslog"
 )
 
 type Updater struct {
@@ -43,8 +44,9 @@ func (u *Updater) PrepareUSB(usbMountPath string) error {
 // ProcessMaps scans the USB drive for map files and uploads them to the
 // DBC. The supplied context bounds the **entire** map processing phase;
 // per-file transfers run under child contexts derived from perFileTimeout
-// so one slow file can't starve later ones.
-func (u *Updater) ProcessMaps(ctx context.Context, perFileTimeout time.Duration, usbMountPath string) error {
+// so one slow file can't starve later ones. If logger is non-nil, upload
+// progress is published to the `usb` hash for the UI.
+func (u *Updater) ProcessMaps(ctx context.Context, perFileTimeout time.Duration, logger *umslog.Logger, usbMountPath string) error {
 	mapsDir := filepath.Join(usbMountPath, "maps")
 
 	entries, err := os.ReadDir(mapsDir)
@@ -77,13 +79,13 @@ func (u *Updater) ProcessMaps(ctx context.Context, perFileTimeout time.Duration,
 	}
 
 	if mbtilesFile != "" {
-		if err := u.processMBTiles(ctx, perFileTimeout, mbtilesFile); err != nil {
+		if err := u.processMBTiles(ctx, perFileTimeout, logger, mbtilesFile); err != nil {
 			return fmt.Errorf("failed to process mbtiles: %w", err)
 		}
 	}
 
 	if tilesFile != "" {
-		if err := u.processTilesTar(ctx, perFileTimeout, tilesFile); err != nil {
+		if err := u.processTilesTar(ctx, perFileTimeout, logger, tilesFile); err != nil {
 			return fmt.Errorf("failed to process tiles.tar: %w", err)
 		}
 	}
@@ -95,7 +97,7 @@ func (u *Updater) ProcessMaps(ctx context.Context, perFileTimeout time.Duration,
 	return nil
 }
 
-func (u *Updater) processMBTiles(ctx context.Context, timeout time.Duration, localPath string) error {
+func (u *Updater) processMBTiles(ctx context.Context, timeout time.Duration, logger *umslog.Logger, localPath string) error {
 	opCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
@@ -105,7 +107,12 @@ func (u *Updater) processMBTiles(ctx context.Context, timeout time.Duration, loc
 
 	remotePath := filepath.Join(u.dbcMapsDir, "map.mbtiles")
 
-	if err := u.dbcInterface.TransferFile(opCtx, localPath, remotePath, nil); err != nil {
+	var progress dbc.ProgressFunc
+	if logger != nil {
+		progress = logger.ProgressCallback("map.mbtiles")
+		defer logger.ClearProgress()
+	}
+	if err := u.dbcInterface.TransferFile(opCtx, localPath, remotePath, progress); err != nil {
 		return fmt.Errorf("failed to transfer mbtiles to DBC: %w", err)
 	}
 
@@ -113,7 +120,7 @@ func (u *Updater) processMBTiles(ctx context.Context, timeout time.Duration, loc
 	return nil
 }
 
-func (u *Updater) processTilesTar(ctx context.Context, timeout time.Duration, localPath string) error {
+func (u *Updater) processTilesTar(ctx context.Context, timeout time.Duration, logger *umslog.Logger, localPath string) error {
 	opCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
@@ -123,7 +130,12 @@ func (u *Updater) processTilesTar(ctx context.Context, timeout time.Duration, lo
 
 	remotePath := filepath.Join(u.dbcValhallaDir, "tiles.tar")
 
-	if err := u.dbcInterface.TransferFile(opCtx, localPath, remotePath, nil); err != nil {
+	var progress dbc.ProgressFunc
+	if logger != nil {
+		progress = logger.ProgressCallback("tiles.tar")
+		defer logger.ClearProgress()
+	}
+	if err := u.dbcInterface.TransferFile(opCtx, localPath, remotePath, progress); err != nil {
 		return fmt.Errorf("failed to transfer tiles.tar to DBC: %w", err)
 	}
 

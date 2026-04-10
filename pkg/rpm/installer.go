@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/librescoot/ums-service/pkg/dbc"
+	"github.com/librescoot/ums-service/pkg/umslog"
 )
 
 type Installer struct {
@@ -38,12 +39,12 @@ func (i *Installer) PrepareUSB(usbMountPath string) error {
 	return nil
 }
 
-func (i *Installer) ProcessRPMs(ctx context.Context, dbcTimeout time.Duration, usbMountPath string) error {
+func (i *Installer) ProcessRPMs(ctx context.Context, dbcTimeout time.Duration, logger *umslog.Logger, usbMountPath string) error {
 	if err := i.processMDBRPMs(usbMountPath); err != nil {
 		return fmt.Errorf("failed to process MDB RPMs: %w", err)
 	}
 
-	if err := i.processDBCRPMs(ctx, dbcTimeout, usbMountPath); err != nil {
+	if err := i.processDBCRPMs(ctx, dbcTimeout, logger, usbMountPath); err != nil {
 		return fmt.Errorf("failed to process DBC RPMs: %w", err)
 	}
 
@@ -85,7 +86,7 @@ func (i *Installer) processMDBRPMs(usbMountPath string) error {
 
 const dbcRPMDir = "/tmp/ums-rpms"
 
-func (i *Installer) processDBCRPMs(ctx context.Context, timeout time.Duration, usbMountPath string) error {
+func (i *Installer) processDBCRPMs(ctx context.Context, timeout time.Duration, logger *umslog.Logger, usbMountPath string) error {
 	rpms := collectRPMs(filepath.Join(usbMountPath, "rpms", "dbc"))
 	if len(rpms) == 0 {
 		return nil
@@ -109,10 +110,20 @@ func (i *Installer) processDBCRPMs(ctx context.Context, timeout time.Duration, u
 		filename := filepath.Base(localPath)
 		remotePath := fmt.Sprintf("%s/%s", dbcRPMDir, filename)
 
-		if err := i.dbcInterface.TransferFile(opCtx, localPath, remotePath, nil); err != nil {
+		var progress dbc.ProgressFunc
+		if logger != nil {
+			progress = logger.ProgressCallback(filename)
+		}
+		if err := i.dbcInterface.TransferFile(opCtx, localPath, remotePath, progress); err != nil {
+			if logger != nil {
+				logger.ClearProgress()
+			}
 			return fmt.Errorf("failed to transfer %s to DBC: %w", filename, err)
 		}
 		remoteFiles = append(remoteFiles, remotePath)
+	}
+	if logger != nil {
+		logger.ClearProgress()
 	}
 
 	installCmd := fmt.Sprintf("rpm -Uvh --force %s", strings.Join(remoteFiles, " "))
