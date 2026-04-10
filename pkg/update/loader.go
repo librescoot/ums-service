@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	ipc "github.com/librescoot/redis-ipc"
 	"github.com/librescoot/ums-service/pkg/dbc"
@@ -38,7 +39,7 @@ func (l *Loader) PrepareUSB(usbMountPath string) error {
 	return nil
 }
 
-func (l *Loader) ProcessUpdates(usbMountPath string) error {
+func (l *Loader) ProcessUpdates(ctx context.Context, perFileTimeout time.Duration, usbMountPath string) error {
 	updateDir := filepath.Join(usbMountPath, "system-update")
 
 	entries, err := os.ReadDir(updateDir)
@@ -67,7 +68,7 @@ func (l *Loader) ProcessUpdates(usbMountPath string) error {
 				return fmt.Errorf("failed to process MDB update: %w", err)
 			}
 		} else if strings.Contains(filename, "-dbc") {
-			if err := l.processDBCUpdate(srcPath); err != nil {
+			if err := l.processDBCUpdate(ctx, perFileTimeout, srcPath); err != nil {
 				return fmt.Errorf("failed to process DBC update: %w", err)
 			}
 		}
@@ -120,7 +121,7 @@ func copyFile(src, dst string) error {
 	return out.Sync()
 }
 
-func (l *Loader) processDBCUpdate(srcPath string) error {
+func (l *Loader) processDBCUpdate(ctx context.Context, timeout time.Duration, srcPath string) error {
 	filename := filepath.Base(srcPath)
 	log.Printf("Processing DBC update: %s", filename)
 
@@ -128,13 +129,16 @@ func (l *Loader) processDBCUpdate(srcPath string) error {
 		return fmt.Errorf("DBC interface not enabled for update")
 	}
 
+	opCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
 	remotePath := filepath.Join(l.dbcOtaDir, filename)
 
-	if _, err := l.dbcInterface.RunCommand(fmt.Sprintf("mkdir -p %s", l.dbcOtaDir)); err != nil {
+	if _, err := l.dbcInterface.RunCommand(opCtx, fmt.Sprintf("mkdir -p %s", l.dbcOtaDir)); err != nil {
 		return fmt.Errorf("failed to create remote OTA directory: %w", err)
 	}
 
-	if err := l.dbcInterface.TransferFile(context.Background(), srcPath, remotePath, nil); err != nil {
+	if err := l.dbcInterface.TransferFile(opCtx, srcPath, remotePath, nil); err != nil {
 		return fmt.Errorf("failed to transfer update to DBC: %w", err)
 	}
 

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/librescoot/ums-service/pkg/dbc"
 )
@@ -39,9 +40,13 @@ func (u *Updater) PrepareUSB(usbMountPath string) error {
 	return nil
 }
 
-func (u *Updater) ProcessMaps(usbMountPath string) error {
+// ProcessMaps scans the USB drive for map files and uploads them to the
+// DBC. The supplied context bounds the **entire** map processing phase;
+// per-file transfers run under child contexts derived from perFileTimeout
+// so one slow file can't starve later ones.
+func (u *Updater) ProcessMaps(ctx context.Context, perFileTimeout time.Duration, usbMountPath string) error {
 	mapsDir := filepath.Join(usbMountPath, "maps")
-	
+
 	entries, err := os.ReadDir(mapsDir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -71,16 +76,14 @@ func (u *Updater) ProcessMaps(usbMountPath string) error {
 		}
 	}
 
-	// Process mbtiles file
 	if mbtilesFile != "" {
-		if err := u.processMBTiles(mbtilesFile); err != nil {
+		if err := u.processMBTiles(ctx, perFileTimeout, mbtilesFile); err != nil {
 			return fmt.Errorf("failed to process mbtiles: %w", err)
 		}
 	}
 
-	// Process tiles.tar file
 	if tilesFile != "" {
-		if err := u.processTilesTar(tilesFile); err != nil {
+		if err := u.processTilesTar(ctx, perFileTimeout, tilesFile); err != nil {
 			return fmt.Errorf("failed to process tiles.tar: %w", err)
 		}
 	}
@@ -92,16 +95,17 @@ func (u *Updater) ProcessMaps(usbMountPath string) error {
 	return nil
 }
 
-func (u *Updater) processMBTiles(localPath string) error {
-	// Create remote maps directory
-	if _, err := u.dbcInterface.RunCommand(fmt.Sprintf("mkdir -p %s", u.dbcMapsDir)); err != nil {
+func (u *Updater) processMBTiles(ctx context.Context, timeout time.Duration, localPath string) error {
+	opCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	if _, err := u.dbcInterface.RunCommand(opCtx, fmt.Sprintf("mkdir -p %s", u.dbcMapsDir)); err != nil {
 		return fmt.Errorf("failed to create remote maps directory: %w", err)
 	}
 
 	remotePath := filepath.Join(u.dbcMapsDir, "map.mbtiles")
 
-	// Upload mbtiles file to DBC (HTTP PUT with SCP fallback)
-	if err := u.dbcInterface.TransferFile(context.Background(), localPath, remotePath, nil); err != nil {
+	if err := u.dbcInterface.TransferFile(opCtx, localPath, remotePath, nil); err != nil {
 		return fmt.Errorf("failed to transfer mbtiles to DBC: %w", err)
 	}
 
@@ -109,16 +113,17 @@ func (u *Updater) processMBTiles(localPath string) error {
 	return nil
 }
 
-func (u *Updater) processTilesTar(localPath string) error {
-	// Create remote valhalla directory
-	if _, err := u.dbcInterface.RunCommand(fmt.Sprintf("mkdir -p %s", u.dbcValhallaDir)); err != nil {
+func (u *Updater) processTilesTar(ctx context.Context, timeout time.Duration, localPath string) error {
+	opCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	if _, err := u.dbcInterface.RunCommand(opCtx, fmt.Sprintf("mkdir -p %s", u.dbcValhallaDir)); err != nil {
 		return fmt.Errorf("failed to create remote valhalla directory: %w", err)
 	}
 
 	remotePath := filepath.Join(u.dbcValhallaDir, "tiles.tar")
 
-	// Upload tiles.tar file to DBC (HTTP PUT with SCP fallback)
-	if err := u.dbcInterface.TransferFile(context.Background(), localPath, remotePath, nil); err != nil {
+	if err := u.dbcInterface.TransferFile(opCtx, localPath, remotePath, nil); err != nil {
 		return fmt.Errorf("failed to transfer tiles.tar to DBC: %w", err)
 	}
 

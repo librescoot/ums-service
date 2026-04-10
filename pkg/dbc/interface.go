@@ -149,7 +149,7 @@ func (i *Interface) startHTTPServer() error {
 	return nil
 }
 
-func (i *Interface) DownloadFile(localPath, remotePath string) error {
+func (i *Interface) DownloadFile(ctx context.Context, localPath, remotePath string) error {
 	if !i.enabled {
 		return fmt.Errorf("DBC interface not enabled")
 	}
@@ -157,7 +157,7 @@ func (i *Interface) DownloadFile(localPath, remotePath string) error {
 	filename := filepath.Base(localPath)
 	url := fmt.Sprintf("http://192.168.7.1:%d/%s", i.port, filename)
 
-	cmd := exec.Command("ssh",
+	cmd := exec.CommandContext(ctx, "ssh",
 		"-o", "StrictHostKeyChecking=no",
 		"-o", "UserKnownHostsFile=/dev/null",
 		fmt.Sprintf("root@%s", i.ip),
@@ -172,12 +172,12 @@ func (i *Interface) DownloadFile(localPath, remotePath string) error {
 	return nil
 }
 
-func (i *Interface) CopyFile(localPath, remotePath string) error {
+func (i *Interface) CopyFile(ctx context.Context, localPath, remotePath string) error {
 	if !i.enabled {
 		return fmt.Errorf("DBC interface not enabled")
 	}
 
-	cmd := exec.Command("scp",
+	cmd := exec.CommandContext(ctx, "scp",
 		"-o", "StrictHostKeyChecking=no",
 		"-o", "UserKnownHostsFile=/dev/null",
 		localPath,
@@ -192,12 +192,12 @@ func (i *Interface) CopyFile(localPath, remotePath string) error {
 	return nil
 }
 
-func (i *Interface) RunCommand(command string) (string, error) {
+func (i *Interface) RunCommand(ctx context.Context, command string) (string, error) {
 	if !i.enabled {
 		return "", fmt.Errorf("DBC interface not enabled")
 	}
 
-	cmd := exec.Command("ssh",
+	cmd := exec.CommandContext(ctx, "ssh",
 		"-o", "StrictHostKeyChecking=no",
 		"-o", "UserKnownHostsFile=/dev/null",
 		fmt.Sprintf("root@%s", i.ip),

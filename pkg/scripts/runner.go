@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"time"
 
 	"github.com/librescoot/ums-service/pkg/dbc"
 )
@@ -30,7 +31,7 @@ func (r *Runner) PrepareUSB(usbMountPath string) error {
 	return nil
 }
 
-func (r *Runner) ProcessScripts(usbMountPath string) error {
+func (r *Runner) ProcessScripts(ctx context.Context, dbcTimeout time.Duration, usbMountPath string) error {
 	scriptsDir := filepath.Join(usbMountPath, "scripts")
 
 	if _, err := os.Stat(scriptsDir); os.IsNotExist(err) {
@@ -38,7 +39,7 @@ func (r *Runner) ProcessScripts(usbMountPath string) error {
 	}
 
 	r.runMDBScript(scriptsDir)
-	r.runDBCScript(scriptsDir)
+	r.runDBCScript(ctx, dbcTimeout, scriptsDir)
 
 	return nil
 }
@@ -73,7 +74,7 @@ func (r *Runner) runMDBScript(scriptsDir string) {
 	log.Printf("MDB script output: %s", string(output))
 }
 
-func (r *Runner) runDBCScript(scriptsDir string) {
+func (r *Runner) runDBCScript(ctx context.Context, timeout time.Duration, scriptsDir string) {
 	srcPath := filepath.Join(scriptsDir, "dbc.sh")
 	if _, err := os.Stat(srcPath); os.IsNotExist(err) {
 		return
@@ -86,13 +87,16 @@ func (r *Runner) runDBCScript(scriptsDir string) {
 
 	log.Println("Running DBC script")
 
+	opCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
 	remotePath := "/tmp/dbc.sh"
-	if err := r.dbcInterface.TransferFile(context.Background(), srcPath, remotePath, nil); err != nil {
+	if err := r.dbcInterface.TransferFile(opCtx, srcPath, remotePath, nil); err != nil {
 		log.Printf("Failed to transfer dbc.sh to DBC: %v", err)
 		return
 	}
 
-	output, err := r.dbcInterface.RunCommand(fmt.Sprintf("bash %s", remotePath))
+	output, err := r.dbcInterface.RunCommand(opCtx, fmt.Sprintf("bash %s", remotePath))
 	if err != nil {
 		log.Printf("DBC script failed: %v", err)
 		return

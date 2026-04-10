@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/librescoot/ums-service/pkg/dbc"
 )
@@ -37,12 +38,12 @@ func (i *Installer) PrepareUSB(usbMountPath string) error {
 	return nil
 }
 
-func (i *Installer) ProcessRPMs(usbMountPath string) error {
+func (i *Installer) ProcessRPMs(ctx context.Context, dbcTimeout time.Duration, usbMountPath string) error {
 	if err := i.processMDBRPMs(usbMountPath); err != nil {
 		return fmt.Errorf("failed to process MDB RPMs: %w", err)
 	}
 
-	if err := i.processDBCRPMs(usbMountPath); err != nil {
+	if err := i.processDBCRPMs(ctx, dbcTimeout, usbMountPath); err != nil {
 		return fmt.Errorf("failed to process DBC RPMs: %w", err)
 	}
 
@@ -84,7 +85,7 @@ func (i *Installer) processMDBRPMs(usbMountPath string) error {
 
 const dbcRPMDir = "/tmp/ums-rpms"
 
-func (i *Installer) processDBCRPMs(usbMountPath string) error {
+func (i *Installer) processDBCRPMs(ctx context.Context, timeout time.Duration, usbMountPath string) error {
 	rpms := collectRPMs(filepath.Join(usbMountPath, "rpms", "dbc"))
 	if len(rpms) == 0 {
 		return nil
@@ -94,9 +95,12 @@ func (i *Installer) processDBCRPMs(usbMountPath string) error {
 		return fmt.Errorf("DBC interface not enabled for RPM installation")
 	}
 
+	opCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
 	log.Printf("Installing %d DBC RPM(s)", len(rpms))
 
-	if _, err := i.dbcInterface.RunCommand(fmt.Sprintf("mkdir -p %s", dbcRPMDir)); err != nil {
+	if _, err := i.dbcInterface.RunCommand(opCtx, fmt.Sprintf("mkdir -p %s", dbcRPMDir)); err != nil {
 		return fmt.Errorf("failed to create remote RPM directory: %w", err)
 	}
 
@@ -105,23 +109,26 @@ func (i *Installer) processDBCRPMs(usbMountPath string) error {
 		filename := filepath.Base(localPath)
 		remotePath := fmt.Sprintf("%s/%s", dbcRPMDir, filename)
 
-		if err := i.dbcInterface.TransferFile(context.Background(), localPath, remotePath, nil); err != nil {
+		if err := i.dbcInterface.TransferFile(opCtx, localPath, remotePath, nil); err != nil {
 			return fmt.Errorf("failed to transfer %s to DBC: %w", filename, err)
 		}
 		remoteFiles = append(remoteFiles, remotePath)
 	}
 
 	installCmd := fmt.Sprintf("rpm -Uvh --force %s", strings.Join(remoteFiles, " "))
-	output, err := i.dbcInterface.RunCommand(installCmd)
+	output, err := i.dbcInterface.RunCommand(opCtx, installCmd)
 	if err != nil {
-		// Clean up even on failure
-		i.dbcInterface.RunCommand(fmt.Sprintf("rm -rf %s", dbcRPMDir))
+		// Clean up even on failure — use a fresh short context in case
+		// the outer one is already done.
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		i.dbcInterface.RunCommand(cleanupCtx, fmt.Sprintf("rm -rf %s", dbcRPMDir))
+		cleanupCancel()
 		return fmt.Errorf("DBC rpm install failed: %v", err)
 	}
 
 	log.Printf("DBC RPM install output: %s", output)
 
-	if _, err := i.dbcInterface.RunCommand(fmt.Sprintf("rm -rf %s", dbcRPMDir)); err != nil {
+	if _, err := i.dbcInterface.RunCommand(opCtx, fmt.Sprintf("rm -rf %s", dbcRPMDir)); err != nil {
 		log.Printf("Failed to clean up remote RPMs: %v", err)
 	}
 

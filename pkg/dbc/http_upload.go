@@ -131,12 +131,16 @@ func (i *Interface) uploadServerReady() bool {
 }
 
 // stopUploadServer kills the Python server on the DBC and removes its pidfile.
-// Safe to call even if the server was never started.
+// Safe to call even if the server was never started. Bounded by a short
+// deadline so Disable() can't hang on an unresponsive DBC.
 func (i *Interface) stopUploadServer() {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
 	// `sync` before the kill is a belt-and-braces backstop in case any
 	// recent upload hasn't been fsync'd yet — Disable() is about to cut
 	// DBC power, and any dirty pages on the eMMC would be lost.
-	cmd := exec.Command("ssh",
+	cmd := exec.CommandContext(ctx, "ssh",
 		"-o", "StrictHostKeyChecking=no",
 		"-o", "UserKnownHostsFile=/dev/null",
 		"-o", "ConnectTimeout=5",
@@ -236,13 +240,20 @@ func (i *Interface) UploadFile(ctx context.Context, localPath, remotePath string
 
 // TransferFile sends localPath to remotePath on the DBC. Tries the fast
 // HTTP-PUT path first and falls back to SCP on failure. progressCb may be
-// nil and is only invoked on the HTTP path.
+// nil and is only invoked on the HTTP path. The context bounds the whole
+// operation — both the HTTP attempt and the SCP fallback. On failure, the
+// remote path is logged so a caller can chase down any partial file left
+// on the DBC.
 func (i *Interface) TransferFile(ctx context.Context, localPath, remotePath string, progressCb ProgressFunc) error {
 	if err := i.UploadFile(ctx, localPath, remotePath, progressCb); err == nil {
 		return nil
 	} else {
 		log.Printf("HTTP upload of %s failed, falling back to SCP: %v", localPath, err)
 	}
-	return i.CopyFile(localPath, remotePath)
+	if err := i.CopyFile(ctx, localPath, remotePath); err != nil {
+		log.Printf("DBC transfer failed for %s -> %s (partial file may remain on DBC)", localPath, remotePath)
+		return err
+	}
+	return nil
 }
 
