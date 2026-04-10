@@ -69,10 +69,26 @@ with open("/tmp/upload_srv.pid", "w") as pf:
 http.server.HTTPServer(("0.0.0.0", PORT), H).serve_forever()
 `
 
-// startUploadServer writes the Python PUT server to /tmp/upload_srv.py on the
-// DBC and launches it detached via nohup. Returns once the server is ready to
-// accept connections (or the timeout elapses).
+// dataServerHeaderPrefix is what librescoot-data-server sets in its
+// Server: response header — used to distinguish it from a plain
+// python3 http.server (which sends BaseHTTP/x.y Python/z.w).
+const dataServerHeaderPrefix = "librescoot-data-server/"
+
+// startUploadServer establishes an HTTP PUT endpoint on the DBC for
+// fast file transfers. Preference order:
+//
+//  1. If librescoot-data-server is already running on 8080 (detected
+//     via its Server: header), use that directly — no bootstrap needed.
+//  2. Otherwise, write /tmp/upload_srv.py over SSH and launch it
+//     detached via nohup, matching the installer trampoline pattern.
+//  3. If both fail, return error — callers fall through to SCP.
 func (i *Interface) startUploadServer(ctx context.Context) error {
+	if kind, ok := i.probeUploadServer(ctx); ok {
+		i.uploadServerKind = kind
+		log.Printf("DBC upload server: using existing %s on %s:%d", kindName(kind), i.ip, uploadServerPort)
+		return nil
+	}
+
 	script := strings.Replace(uploadServerScript, "PORT", fmt.Sprintf("%d", uploadServerPort), 1)
 
 	// Write the script (cat runs foreground so it actually reads stdin),
@@ -98,14 +114,15 @@ func (i *Interface) startUploadServer(ctx context.Context) error {
 		return fmt.Errorf("failed to start DBC upload server: %w (output: %s)", err, string(out))
 	}
 
-	// Wait up to 10s for the port to accept a connection.
+	// Wait up to 10s for the bootstrapped server to come up.
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if i.uploadServerReady() {
-			log.Printf("DBC upload server ready on %s:%d", i.ip, uploadServerPort)
+		if kind, ok := i.probeUploadServer(ctx); ok {
+			i.uploadServerKind = kind
+			log.Printf("DBC upload server ready on %s:%d (%s)", i.ip, uploadServerPort, kindName(kind))
 			return nil
 		}
 		time.Sleep(200 * time.Millisecond)
@@ -113,42 +130,85 @@ func (i *Interface) startUploadServer(ctx context.Context) error {
 	return fmt.Errorf("DBC upload server did not become ready within 10s")
 }
 
-// uploadServerReady pokes the PUT endpoint to see if the server is up.
-// A HEAD-like request will 501 but that's fine — we just want the TCP accept.
-func (i *Interface) uploadServerReady() bool {
+// probeUploadServer pokes the port with a GET / and classifies the
+// response. Returns (kind, true) if something answered, (_, false) if
+// nothing is there.
+func (i *Interface) probeUploadServer(ctx context.Context) (uploadServerKind, bool) {
+	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
 	url := fmt.Sprintf("http://%s:%d/", i.ip, uploadServerPort)
-	client := &http.Client{Timeout: 500 * time.Millisecond}
-	req, err := http.NewRequest(http.MethodHead, url, nil)
+	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, url, nil)
 	if err != nil {
-		return false
+		return uploadServerNone, false
 	}
+	// Accept JSON to nudge data-server into returning its listing
+	// instead of the HTML UI (which is content-negotiated).
+	req.Header.Set("Accept", "application/json")
+
+	client := &http.Client{Timeout: 2 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return false
+		return uploadServerNone, false
 	}
-	resp.Body.Close()
-	return true
+	defer resp.Body.Close()
+
+	if strings.HasPrefix(resp.Header.Get("Server"), dataServerHeaderPrefix) {
+		return uploadServerDataServer, true
+	}
+	// Any other responder on the port — almost certainly our Python
+	// bootstrap. Treat as such; worst case the PUT paths will 404 and
+	// we fall through to SCP.
+	return uploadServerBootstrapped, true
 }
 
-// stopUploadServer kills the Python server on the DBC and removes its pidfile.
-// Safe to call even if the server was never started. Bounded by a short
-// deadline so Disable() can't hang on an unresponsive DBC.
+func kindName(k uploadServerKind) string {
+	switch k {
+	case uploadServerDataServer:
+		return "librescoot-data-server"
+	case uploadServerBootstrapped:
+		return "bootstrapped upload_srv.py"
+	default:
+		return "none"
+	}
+}
+
+// stopUploadServer tears down whatever HTTP PUT endpoint we were using.
+// For a bootstrapped python server it kills the process and wipes the
+// /tmp/upload_srv.* files. For a pre-existing data-server it only runs
+// a plain `sync` as a power-cut backstop. For either, the ssh call is
+// bounded so Disable() can't hang on an unresponsive DBC.
 func (i *Interface) stopUploadServer() {
+	if i.uploadServerKind == uploadServerNone {
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	// `sync` before the kill is a belt-and-braces backstop in case any
-	// recent upload hasn't been fsync'd yet — Disable() is about to cut
-	// DBC power, and any dirty pages on the eMMC would be lost.
+	// `sync` before teardown: data-server's handleWrite already fsyncs
+	// file + parent dir, and our bootstrapped python fsyncs the file —
+	// but Disable() is about to cut DBC power, so sweep anything that
+	// snuck in between the last upload and now.
+	var remoteCmd string
+	switch i.uploadServerKind {
+	case uploadServerDataServer:
+		remoteCmd = "sync"
+	case uploadServerBootstrapped:
+		remoteCmd = "sync; kill $(cat /tmp/upload_srv.pid 2>/dev/null) 2>/dev/null; " +
+			"rm -f /tmp/upload_srv.pid /tmp/upload_srv.py /tmp/upload_srv.log"
+	}
+
 	cmd := exec.CommandContext(ctx, "ssh",
 		"-o", "StrictHostKeyChecking=no",
 		"-o", "UserKnownHostsFile=/dev/null",
 		"-o", "ConnectTimeout=5",
 		fmt.Sprintf("root@%s", i.ip),
-		"sync; kill $(cat /tmp/upload_srv.pid 2>/dev/null) 2>/dev/null; rm -f /tmp/upload_srv.pid /tmp/upload_srv.py /tmp/upload_srv.log")
+		remoteCmd)
 	if err := cmd.Run(); err != nil {
 		log.Printf("stopUploadServer: %v (non-fatal)", err)
 	}
+	i.uploadServerKind = uploadServerNone
 }
 
 // ProgressFunc is called with (bytesSent, totalBytes) as an upload advances.
@@ -176,15 +236,18 @@ func (pr *progressReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// UploadFile streams localPath to the DBC via HTTP PUT against the upload
-// server bootstrapped by startUploadServer. remotePath must start with "/".
-// progressCb may be nil.
+// UploadFile streams localPath to the DBC via HTTP PUT against whatever
+// upload server startUploadServer settled on. remotePath must start with
+// "/". progressCb may be nil.
 //
 // Much faster than SCP for large files because there's no per-block crypto;
 // the installer trampoline uses the same trick for tile uploads.
 func (i *Interface) UploadFile(ctx context.Context, localPath, remotePath string, progressCb ProgressFunc) error {
 	if !i.enabled {
 		return fmt.Errorf("DBC interface not enabled")
+	}
+	if i.uploadServerKind == uploadServerNone {
+		return fmt.Errorf("no DBC upload server available")
 	}
 	if !strings.HasPrefix(remotePath, "/") {
 		return fmt.Errorf("remotePath must be absolute, got %q", remotePath)
@@ -202,7 +265,21 @@ func (i *Interface) UploadFile(ctx context.Context, localPath, remotePath string
 	}
 	size := st.Size()
 
-	url := fmt.Sprintf("http://%s:%d%s", i.ip, uploadServerPort, remotePath)
+	// Path semantics differ between the two servers:
+	//   - bootstrapped python writes to self.path as an absolute path,
+	//     so PUT /data/maps/map.mbtiles → /data/maps/map.mbtiles
+	//   - librescoot-data-server joins the request path under -data
+	//     (default /data), so PUT /maps/map.mbtiles → /data/maps/map.mbtiles
+	// Callers always hand us an absolute filesystem path; translate
+	// here rather than burdening each caller with the distinction.
+	urlPath := remotePath
+	if i.uploadServerKind == uploadServerDataServer {
+		urlPath = strings.TrimPrefix(remotePath, "/data")
+		if urlPath == "" || urlPath[0] != '/' {
+			return fmt.Errorf("data-server mode requires remotePath under /data, got %q", remotePath)
+		}
+	}
+	url := fmt.Sprintf("http://%s:%d%s", i.ip, uploadServerPort, urlPath)
 
 	body := &progressReader{r: f, total: size, progress: progressCb}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, body)

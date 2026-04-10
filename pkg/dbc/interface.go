@@ -21,15 +21,36 @@ import (
 // window and leaves slack for transient redis delays.
 const heartbeatInterval = 5 * time.Minute
 
+// uploadServerKind identifies which variant of HTTP PUT endpoint is
+// running on the DBC for a given Enable() cycle.
+type uploadServerKind int
+
+const (
+	// uploadServerNone means the HTTP PUT path is unavailable — callers
+	// will fall through to SCP. Either startup failed or no python3 is
+	// present.
+	uploadServerNone uploadServerKind = iota
+	// uploadServerBootstrapped is the ums-service's own ephemeral Python
+	// server written to /tmp/upload_srv.py and launched over SSH. Accepts
+	// PUT at absolute paths (PUT /data/maps/foo writes /data/maps/foo).
+	uploadServerBootstrapped
+	// uploadServerDataServer is librescoot-data-server running as a
+	// long-lived service on the DBC (newer LibreScoot images). Accepts
+	// PUT at paths relative to its -data dir (PUT /maps/foo writes
+	// <dataDir>/maps/foo). Identified via the `Server:` response header.
+	uploadServerDataServer
+)
+
 type Interface struct {
-	ip              string
-	port            int
-	dataDir         string
-	httpServer      *http.Server
-	enabled         bool
-	client          *ipc.Client
-	heartbeatCancel context.CancelFunc
-	heartbeatDone   chan struct{}
+	ip               string
+	port             int
+	dataDir          string
+	httpServer       *http.Server
+	enabled          bool
+	client           *ipc.Client
+	uploadServerKind uploadServerKind
+	heartbeatCancel  context.CancelFunc
+	heartbeatDone    chan struct{}
 }
 
 func New(dataDir string, client *ipc.Client) *Interface {
