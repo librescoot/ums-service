@@ -316,22 +316,82 @@ func (i *Interface) UploadFile(ctx context.Context, localPath, remotePath string
 	return nil
 }
 
-// TransferFile sends localPath to remotePath on the DBC. Tries the fast
-// HTTP-PUT path first and falls back to SCP on failure. progressCb may be
-// nil and is only invoked on the HTTP path. The context bounds the whole
-// operation — both the HTTP attempt and the SCP fallback. On failure, the
-// remote path is logged so a caller can chase down any partial file left
-// on the DBC.
+// TransferFile sends localPath to remotePath on the DBC. Attempts, in
+// order:
+//
+//  1. HTTP PUT against the detected upload server
+//  2. HTTP PUT retry, after re-probing the upload server (covers the
+//     data-server systemd restart window and short-lived hiccups)
+//  3. SCP fallback
+//
+// After any failed attempt the (possibly partial) remote file is
+// removed via ssh rm -f so the next retry starts clean. progressCb is
+// only invoked on the HTTP path. The context bounds the whole
+// operation.
 func (i *Interface) TransferFile(ctx context.Context, localPath, remotePath string, progressCb ProgressFunc) error {
+	// Attempt 1: primary HTTP PUT.
 	if err := i.UploadFile(ctx, localPath, remotePath, progressCb); err == nil {
 		return nil
 	} else {
-		log.Printf("HTTP upload of %s failed, falling back to SCP: %v", localPath, err)
+		log.Printf("HTTP upload of %s failed: %v", localPath, err)
+		i.removePartialRemote(remotePath)
 	}
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	// Attempt 2: re-probe (the server may have been restarted by
+	// systemd or momentarily gone away) and retry HTTP once if
+	// something is back on the port.
+	if kind, ok := i.probeUploadServer(ctx); ok {
+		if kind != i.uploadServerKind {
+			log.Printf("DBC upload server changed %s -> %s, retrying", kindName(i.uploadServerKind), kindName(kind))
+			i.uploadServerKind = kind
+		} else {
+			log.Printf("DBC upload server still reachable, retrying once")
+		}
+		if err := i.UploadFile(ctx, localPath, remotePath, progressCb); err == nil {
+			return nil
+		} else {
+			log.Printf("HTTP upload retry of %s failed: %v", localPath, err)
+			i.removePartialRemote(remotePath)
+		}
+	}
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	// Attempt 3: SCP fallback.
+	log.Printf("falling back to SCP for %s", localPath)
 	if err := i.CopyFile(ctx, localPath, remotePath); err != nil {
-		log.Printf("DBC transfer failed for %s -> %s (partial file may remain on DBC)", localPath, remotePath)
+		log.Printf("DBC transfer failed for %s -> %s (all paths exhausted)", localPath, remotePath)
+		i.removePartialRemote(remotePath)
 		return err
 	}
 	return nil
+}
+
+// removePartialRemote best-effort-deletes a remote file via ssh rm -f.
+// Used to wipe partial data between retry attempts so each attempt
+// starts from a clean slate. Errors are non-fatal — the file might
+// simply not exist, or the DBC might be briefly unreachable, and in
+// either case the next step will either succeed over or retry past.
+func (i *Interface) removePartialRemote(remotePath string) {
+	if remotePath == "" || remotePath == "/" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "ssh",
+		"-o", "StrictHostKeyChecking=no",
+		"-o", "UserKnownHostsFile=/dev/null",
+		"-o", "ConnectTimeout=5",
+		fmt.Sprintf("root@%s", i.ip),
+		fmt.Sprintf("rm -f %q", remotePath))
+	if err := cmd.Run(); err != nil {
+		log.Printf("cleanup of partial %s failed (non-fatal): %v", remotePath, err)
+	}
 }
 
