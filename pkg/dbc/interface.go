@@ -39,8 +39,15 @@ func (i *Interface) Enable(ctx context.Context) error {
 	}
 
 	log.Println("Enabling DBC interface...")
-	if _, err := i.client.LPush("scooter:hardware", "dashboard:on"); err != nil {
-		return fmt.Errorf("failed to send dashboard power on command: %w", err)
+
+	// `start-dbc` tells vehicle-service to claim the DBC update lock:
+	// set dbcUpdating=true, arm a safety watchdog, install the
+	// suspend-only inhibitor, and force dashboard_power on. Any
+	// dashboard:off request from the FSM (standby, lock, hibernate) is
+	// then either rejected or deferred until we send complete-dbc. See
+	// vehicle-service/internal/core/redis_handlers.go:167-209.
+	if _, err := i.client.LPush("scooter:update", "start-dbc"); err != nil {
+		return fmt.Errorf("failed to claim DBC update lock: %w", err)
 	}
 
 	ticker := time.NewTicker(1 * time.Second)
@@ -51,14 +58,20 @@ func (i *Interface) Enable(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
+			// Release the lock even on cancellation — we never got to
+			// enabled=true, so our own Disable() won't be called.
+			i.releaseUpdateLock()
 			return ctx.Err()
 		case <-timeout:
+			i.releaseUpdateLock()
 			return fmt.Errorf("timeout waiting for DBC to become reachable")
 		case <-ticker.C:
 			if i.isReachable() {
 				i.enabled = true
 				log.Println("DBC is now reachable")
 				if err := i.startHTTPServer(); err != nil {
+					i.releaseUpdateLock()
+					i.enabled = false
 					return err
 				}
 				if err := i.startUploadServer(ctx); err != nil {
@@ -70,12 +83,28 @@ func (i *Interface) Enable(ctx context.Context) error {
 	}
 }
 
+// releaseUpdateLock sends complete-dbc so vehicle-service clears
+// dbcUpdating, removes the suspend-only inhibitor, and applies any
+// deferred dashboard power changes. Safe to call multiple times.
+func (i *Interface) releaseUpdateLock() {
+	if _, err := i.client.LPush("scooter:update", "complete-dbc"); err != nil {
+		log.Printf("Failed to release DBC update lock: %v", err)
+	}
+}
+
 func (i *Interface) Disable() error {
 	if !i.enabled {
 		return nil
 	}
 
 	log.Println("Disabling DBC interface...")
+
+	// Release the update lock first so any follow-up dashboard:off (or
+	// deferred FSM transitions) are allowed to proceed. Deferred
+	// behavior matters: if the user locked the scooter mid-update,
+	// vehicle-service parked deferredDashboardPower and complete-dbc
+	// is what finally cuts power via the FSM standby path.
+	defer i.releaseUpdateLock()
 
 	i.stopUploadServer()
 
@@ -86,10 +115,6 @@ func (i *Interface) Disable() error {
 			log.Printf("Error shutting down HTTP server: %v", err)
 		}
 		i.httpServer = nil
-	}
-
-	if _, err := i.client.LPush("scooter:hardware", "dashboard:off"); err != nil {
-		return fmt.Errorf("failed to send dashboard power off command: %w", err)
 	}
 
 	i.enabled = false
