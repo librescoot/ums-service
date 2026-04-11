@@ -155,6 +155,14 @@ func (l *Loader) processDBCUpdate(ctx context.Context, timeout time.Duration, lo
 		return fmt.Errorf("failed to notify update service: %w", err)
 	}
 
+	// Tell the dbc.Interface to leave the vehicle-service update lock
+	// held after Disable(). update-service runs the actual mender
+	// installation asynchronously from here and owns its own
+	// start-dbc / complete-dbc cycle around that install. Releasing
+	// now would drop the lock mid-handoff and let the FSM cut DBC
+	// power before the installation finishes.
+	l.dbcInterface.MarkDBCUpdateQueued()
+
 	log.Printf("Successfully queued DBC update: %s", filename)
 	return nil
 }

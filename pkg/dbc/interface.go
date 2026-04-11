@@ -51,6 +51,14 @@ type Interface struct {
 	uploadServerKind uploadServerKind
 	heartbeatCancel  context.CancelFunc
 	heartbeatDone    chan struct{}
+	// dbcUpdateQueued is set when a DBC mender update has been
+	// LPushed to scooter:update:dbc during this Enable/Disable
+	// lifecycle. When true, Disable() skips sending complete-dbc
+	// because update-service will own the lock from its own
+	// start-dbc through its own complete-dbc after installation.
+	// Sending complete-dbc prematurely would drop the lock during
+	// the handoff window and let the FSM cut DBC power mid-install.
+	dbcUpdateQueued bool
 }
 
 func New(dataDir string, client *ipc.Client) *Interface {
@@ -63,12 +71,22 @@ func New(dataDir string, client *ipc.Client) *Interface {
 	}
 }
 
+// MarkDBCUpdateQueued records that a DBC update has been handed off
+// to update-service via scooter:update:dbc. Disable() will then leave
+// the vehicle-service update lock held so update-service's own
+// start-dbc / complete-dbc pair can wrap the actual installation
+// without a dangerous gap where the FSM could cut DBC power.
+func (i *Interface) MarkDBCUpdateQueued() {
+	i.dbcUpdateQueued = true
+}
+
 func (i *Interface) Enable(ctx context.Context) error {
 	if i.enabled {
 		return nil
 	}
 
 	log.Println("Enabling DBC interface...")
+	i.dbcUpdateQueued = false
 
 	// `start-dbc` tells vehicle-service to claim the DBC update lock:
 	// set dbcUpdating=true, arm a safety watchdog, install the
@@ -170,18 +188,34 @@ func (i *Interface) Disable() error {
 
 	log.Println("Disabling DBC interface...")
 
+	// If a DBC mender update was queued to update-service during
+	// this cycle, DO NOT release the update lock here. update-service
+	// runs the mender installation asynchronously after this returns,
+	// and it owns its own start-dbc / complete-dbc cycle around that
+	// install. Releasing here would drop the lock during the handoff
+	// window and let the FSM cut DBC power mid-install. The heartbeat
+	// goroutine keeps re-arming our start-dbc until we stop it below,
+	// and update-service's start-dbc (re-arming the same flag) takes
+	// over from there.
+	releaseLock := !i.dbcUpdateQueued
+	if !releaseLock {
+		log.Println("DBC update queued to update-service; leaving update lock held for handoff")
+	}
+
 	// Stop the heartbeat FIRST, then release the lock. Reversing the
 	// order would race: a heartbeat tick between releaseUpdateLock and
 	// stopHeartbeat could re-claim the DBC update lock after we told
 	// vehicle-service we were done.
 	i.stopHeartbeat()
 
-	// Release the update lock so any follow-up dashboard:off (or
-	// deferred FSM transitions) are allowed to proceed. Deferred
-	// behavior matters: if the user locked the scooter mid-update,
-	// vehicle-service parked deferredDashboardPower and complete-dbc
-	// is what finally cuts power via the FSM standby path.
-	defer i.releaseUpdateLock()
+	if releaseLock {
+		// Release the update lock so any follow-up dashboard:off (or
+		// deferred FSM transitions) are allowed to proceed. Deferred
+		// behavior matters: if the user locked the scooter mid-update,
+		// vehicle-service parked deferredDashboardPower and complete-dbc
+		// is what finally cuts power via the FSM standby path.
+		defer i.releaseUpdateLock()
+	}
 
 	i.stopUploadServer()
 
