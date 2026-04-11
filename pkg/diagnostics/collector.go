@@ -68,9 +68,7 @@ func (c *Collector) collectDBC(dir string) {
 
 func (c *Collector) runDBCCommand(command string) (string, error) {
 	cmd := exec.Command("ssh",
-		"-o", "StrictHostKeyChecking=no",
-		"-o", "UserKnownHostsFile=/dev/null",
-		"-o", "ConnectTimeout=5",
+		"-y",
 		fmt.Sprintf("root@%s", dbcIP),
 		command)
 	output, err := cmd.CombinedOutput()

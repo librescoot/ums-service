@@ -103,9 +103,7 @@ func (i *Interface) startUploadServer(ctx context.Context) error {
 	defer cancel()
 
 	cmd := exec.CommandContext(sshCtx, "ssh",
-		"-o", "StrictHostKeyChecking=no",
-		"-o", "UserKnownHostsFile=/dev/null",
-		"-o", "ConnectTimeout=5",
+		"-y",
 		fmt.Sprintf("root@%s", i.ip),
 		remoteCmd)
 	cmd.Stdin = strings.NewReader(script)
@@ -200,9 +198,7 @@ func (i *Interface) stopUploadServer() {
 	}
 
 	cmd := exec.CommandContext(ctx, "ssh",
-		"-o", "StrictHostKeyChecking=no",
-		"-o", "UserKnownHostsFile=/dev/null",
-		"-o", "ConnectTimeout=5",
+		"-y",
 		fmt.Sprintf("root@%s", i.ip),
 		remoteCmd)
 	if err := cmd.Run(); err != nil {
@@ -385,9 +381,7 @@ func (i *Interface) removePartialRemote(remotePath string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "ssh",
-		"-o", "StrictHostKeyChecking=no",
-		"-o", "UserKnownHostsFile=/dev/null",
-		"-o", "ConnectTimeout=5",
+		"-y",
 		fmt.Sprintf("root@%s", i.ip),
 		fmt.Sprintf("rm -f %q", remotePath))
 	if err := cmd.Run(); err != nil {

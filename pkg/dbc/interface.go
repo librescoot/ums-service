@@ -234,9 +234,11 @@ func (i *Interface) DownloadFile(ctx context.Context, localPath, remotePath stri
 	filename := filepath.Base(localPath)
 	url := fmt.Sprintf("http://192.168.7.1:%d/%s", i.port, filename)
 
+	// `-y` on dbclient auto-accepts unknown host keys. The scooter's
+	// ssh is dropbear, which doesn't understand OpenSSH's `-o Strict...`
+	// options and prints a warning for each one in journald.
 	cmd := exec.CommandContext(ctx, "ssh",
-		"-o", "StrictHostKeyChecking=no",
-		"-o", "UserKnownHostsFile=/dev/null",
+		"-y",
 		fmt.Sprintf("root@%s", i.ip),
 		fmt.Sprintf("wget -O %s %s", remotePath, url))
 
@@ -275,8 +277,7 @@ func (i *Interface) RunCommand(ctx context.Context, command string) (string, err
 	}
 
 	cmd := exec.CommandContext(ctx, "ssh",
-		"-o", "StrictHostKeyChecking=no",
-		"-o", "UserKnownHostsFile=/dev/null",
+		"-y",
 		fmt.Sprintf("root@%s", i.ip),
 		command)
 
