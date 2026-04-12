@@ -1,6 +1,7 @@
 package diagnostics
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net"
@@ -12,8 +13,10 @@ import (
 )
 
 const (
-	dbcIP   = "192.168.7.2"
-	dbcAddr = dbcIP + ":22"
+	dbcIP             = "192.168.7.2"
+	dbcAddr           = dbcIP + ":22"
+	journalMaxAge     = "8 hours ago"
+	dbcCommandTimeout = 30 * time.Second
 )
 
 type Collector struct{}
@@ -55,23 +58,29 @@ func (c *Collector) dbcReachable() bool {
 }
 
 func (c *Collector) collectMDB(dir string) {
-	writeCommandOutput(dir, "journal.log", "journalctl", "--no-pager", "--since", "24 hours ago")
+	writeCommandOutput(dir, "journal.log", "journalctl", "--no-pager", "--since", journalMaxAge)
 	writeCommandOutput(dir, "dmesg.log", "dmesg")
 	c.writeMDBSystemInfo(dir)
 }
 
 func (c *Collector) collectDBC(dir string) {
-	c.writeDBCCommand(dir, "journal.log", "journalctl --no-pager --since '24 hours ago'")
+	c.writeDBCCommand(dir, "journal.log", fmt.Sprintf("journalctl --no-pager --since '%s'", journalMaxAge))
 	c.writeDBCCommand(dir, "dmesg.log", "dmesg")
 	c.writeDBCSystemInfo(dir)
 }
 
 func (c *Collector) runDBCCommand(command string) (string, error) {
-	cmd := exec.Command("ssh",
-		"-y",
+	ctx, cancel := context.WithTimeout(context.Background(), dbcCommandTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx,
+		"ssh", "-y",
 		fmt.Sprintf("root@%s", dbcIP),
 		command)
 	output, err := cmd.CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		return "", fmt.Errorf("ssh command timed out after %v", dbcCommandTimeout)
+	}
 	if err != nil {
 		return "", fmt.Errorf("ssh command failed: %v, output: %s", err, string(output))
 	}
