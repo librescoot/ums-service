@@ -7,11 +7,7 @@ import (
 )
 
 func (s *Service) startBrakeExitListener() error {
-	sub, err := ipc.Subscribe(s.client, "input-events", func(event string) error {
-		if event != "brake:left:hold" {
-			return nil
-		}
-
+	_, err := ipc.Subscribe(s.client, "input-events", func(event string) error {
 		s.mu.Lock()
 		currentMode := s.usbCtrl.GetCurrentMode()
 		s.mu.Unlock()
@@ -23,15 +19,10 @@ func (s *Service) startBrakeExitListener() error {
 		log.Println("Left brake hold detected, exiting UMS mode")
 
 		s.mu.Lock()
-		defer s.mu.Unlock()
 		s.doSwitchToNormal()
+		s.mu.Unlock()
 
 		return nil
 	})
-	if err != nil {
-		return err
-	}
-
-	s.brakeExitSub = sub
-	return nil
+	return err
 }

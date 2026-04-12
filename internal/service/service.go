@@ -45,7 +45,6 @@ type Service struct {
 	mu           sync.Mutex
 	detachCount  int
 	umsModeType  string
-	brakeExitSub *ipc.Subscription[string]
 }
 
 func New(cfg *config.Config) (*Service, error) {
@@ -57,6 +56,7 @@ func New(cfg *config.Config) (*Service, error) {
 	client, err := ipc.New(
 		ipc.WithAddress(redisHost),
 		ipc.WithPort(redisPort),
+		ipc.WithCodec(ipc.StringCodec{}),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Redis client: %w", err)
