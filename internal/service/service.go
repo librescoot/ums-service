@@ -45,6 +45,7 @@ type Service struct {
 	mu           sync.Mutex
 	detachCount  int
 	umsModeType  string
+	brakeExitSub *ipc.Subscription[string]
 }
 
 func New(cfg *config.Config) (*Service, error) {
@@ -124,6 +125,10 @@ func (s *Service) Run(ctx context.Context) error {
 	s.usbCtrl.StartMonitoring()
 
 	go s.detachLoop(ctx)
+
+	if err := s.startBrakeExitListener(); err != nil {
+		return fmt.Errorf("failed to start brake exit listener: %w", err)
+	}
 
 	go func() {
 		<-ctx.Done()
