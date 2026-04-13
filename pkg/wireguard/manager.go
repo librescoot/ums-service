@@ -35,7 +35,7 @@ func (m *Manager) CopyToUSB(usbMountPath string) error {
 	}
 
 	destDir := filepath.Join(usbMountPath, "wireguard")
-	
+
 	// Read all .conf files
 	entries, err := os.ReadDir(m.configDir)
 	if err != nil {
@@ -77,7 +77,7 @@ func (m *Manager) CopyToUSB(usbMountPath string) error {
 
 func (m *Manager) SyncFromUSB(usbMountPath string) (bool, error) {
 	srcDir := filepath.Join(usbMountPath, "wireguard")
-	
+
 	// Check if USB wireguard directory exists
 	if _, err := os.Stat(srcDir); os.IsNotExist(err) {
 		log.Printf("No wireguard directory found on USB drive")

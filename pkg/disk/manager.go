@@ -11,9 +11,9 @@ import (
 const tmpSuffix = ".tmp"
 
 type Manager struct {
-	driveFile   string
-	driveSize   int64
-	mountPoint  string
+	driveFile  string
+	driveSize  int64
+	mountPoint string
 }
 
 func NewManager(driveFile string, driveSize int64) *Manager {

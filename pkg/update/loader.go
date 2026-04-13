@@ -166,4 +166,3 @@ func (l *Loader) processDBCUpdate(ctx context.Context, timeout time.Duration, lo
 	log.Printf("Successfully queued DBC update: %s", filename)
 	return nil
 }
-

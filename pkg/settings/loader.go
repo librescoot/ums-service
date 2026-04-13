@@ -26,7 +26,7 @@ func (l *Loader) CopyToUSB(usbMountPath string) error {
 	}
 
 	destPath := filepath.Join(usbMountPath, "settings.toml")
-	
+
 	input, err := os.ReadFile(l.settingsFile)
 	if err != nil {
 		return fmt.Errorf("failed to read settings file: %w", err)
@@ -42,7 +42,7 @@ func (l *Loader) CopyToUSB(usbMountPath string) error {
 
 func (l *Loader) CopyFromUSB(usbMountPath string) (bool, error) {
 	srcPath := filepath.Join(usbMountPath, "settings.toml")
-	
+
 	if _, err := os.Stat(srcPath); os.IsNotExist(err) {
 		log.Printf("No settings.toml found on USB drive")
 		return false, nil

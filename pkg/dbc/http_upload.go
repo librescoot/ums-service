@@ -388,4 +388,3 @@ func (i *Interface) removePartialRemote(remotePath string) {
 		log.Printf("cleanup of partial %s failed (non-fatal): %v", remotePath, err)
 	}
 }
-
