@@ -25,22 +25,25 @@ func New() *Collector {
 	return &Collector{}
 }
 
-func (c *Collector) CollectToUSB(mountPoint string) {
+func (c *Collector) CollectToUSB(ctx context.Context, mountPoint string) {
 	mdbDir := filepath.Join(mountPoint, "diagnostics", "mdb")
 	if err := os.MkdirAll(mdbDir, 0755); err != nil {
 		log.Printf("Failed to create MDB diagnostics directory: %v", err)
 		return
 	}
 
-	c.collectMDB(mdbDir)
+	c.collectMDB(ctx, mdbDir)
+	if ctx.Err() != nil {
+		return
+	}
 
-	if c.dbcReachable() {
+	if c.dbcReachable(ctx) {
 		dbcDir := filepath.Join(mountPoint, "diagnostics", "dbc")
 		if err := os.MkdirAll(dbcDir, 0755); err != nil {
 			log.Printf("Failed to create DBC diagnostics directory: %v", err)
 			return
 		}
-		c.collectDBC(dbcDir)
+		c.collectDBC(ctx, dbcDir)
 	} else {
 		log.Println("DBC not reachable, skipping DBC diagnostics")
 	}
@@ -48,8 +51,9 @@ func (c *Collector) CollectToUSB(mountPoint string) {
 	log.Println("Diagnostics collection complete")
 }
 
-func (c *Collector) dbcReachable() bool {
-	conn, err := net.DialTimeout("tcp", dbcAddr, 2*time.Second)
+func (c *Collector) dbcReachable(ctx context.Context) bool {
+	d := net.Dialer{Timeout: 2 * time.Second}
+	conn, err := d.DialContext(ctx, "tcp", dbcAddr)
 	if err != nil {
 		return false
 	}
@@ -57,28 +61,37 @@ func (c *Collector) dbcReachable() bool {
 	return true
 }
 
-func (c *Collector) collectMDB(dir string) {
-	writeCommandOutput(dir, "journal.log", "journalctl", "--no-pager", "--since", journalMaxAge)
-	writeCommandOutput(dir, "dmesg.log", "dmesg")
-	c.writeMDBSystemInfo(dir)
+func (c *Collector) collectMDB(ctx context.Context, dir string) {
+	writeCommandOutput(ctx, dir, "journal.log", "journalctl", "--no-pager", "--since", journalMaxAge)
+	writeCommandOutput(ctx, dir, "dmesg.log", "dmesg")
+	c.writeMDBSystemInfo(ctx, dir)
 }
 
-func (c *Collector) collectDBC(dir string) {
-	c.writeDBCCommand(dir, "journal.log", fmt.Sprintf("journalctl --no-pager --since '%s'", journalMaxAge))
-	c.writeDBCCommand(dir, "dmesg.log", "dmesg")
-	c.writeDBCSystemInfo(dir)
+func (c *Collector) collectDBC(ctx context.Context, dir string) {
+	c.writeDBCCommand(ctx, dir, "journal.log", fmt.Sprintf("journalctl --no-pager --since '%s'", journalMaxAge))
+	if ctx.Err() != nil {
+		return
+	}
+	c.writeDBCCommand(ctx, dir, "dmesg.log", "dmesg")
+	if ctx.Err() != nil {
+		return
+	}
+	c.writeDBCSystemInfo(ctx, dir)
 }
 
-func (c *Collector) runDBCCommand(command string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), dbcCommandTimeout)
+func (c *Collector) runDBCCommand(ctx context.Context, command string) (string, error) {
+	opCtx, cancel := context.WithTimeout(ctx, dbcCommandTimeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx,
+	cmd := exec.CommandContext(opCtx,
 		"ssh", "-y",
 		fmt.Sprintf("root@%s", dbcIP),
 		command)
 	output, err := cmd.CombinedOutput()
-	if ctx.Err() == context.DeadlineExceeded {
+	if ctx.Err() != nil {
+		return "", ctx.Err()
+	}
+	if opCtx.Err() == context.DeadlineExceeded {
 		return "", fmt.Errorf("ssh command timed out after %v", dbcCommandTimeout)
 	}
 	if err != nil {
@@ -87,8 +100,8 @@ func (c *Collector) runDBCCommand(command string) (string, error) {
 	return strings.TrimSpace(string(output)), nil
 }
 
-func (c *Collector) writeDBCCommand(dir, filename, command string) {
-	output, err := c.runDBCCommand(command)
+func (c *Collector) writeDBCCommand(ctx context.Context, dir, filename, command string) {
+	output, err := c.runDBCCommand(ctx, command)
 	if err != nil {
 		log.Printf("Failed to collect DBC %s: %v", filename, err)
 		return
@@ -98,9 +111,9 @@ func (c *Collector) writeDBCCommand(dir, filename, command string) {
 	}
 }
 
-func (c *Collector) writeDBCSystemInfo(dir string) {
+func (c *Collector) writeDBCSystemInfo(ctx context.Context, dir string) {
 	cmd := `printf '=== uptime ===\n'; uptime; printf '\n=== disk usage ===\n'; df -h; printf '\n=== memory ===\n'; free -m; printf '\n=== installed packages ===\n'; rpm -qa --last 2>/dev/null | head -50`
-	output, err := c.runDBCCommand(cmd)
+	output, err := c.runDBCCommand(ctx, cmd)
 	if err != nil {
 		log.Printf("Failed to collect DBC system info: %v", err)
 		return
@@ -110,7 +123,7 @@ func (c *Collector) writeDBCSystemInfo(dir string) {
 	}
 }
 
-func (c *Collector) writeMDBSystemInfo(dir string) {
+func (c *Collector) writeMDBSystemInfo(ctx context.Context, dir string) {
 	sections := []struct {
 		header string
 		name   string
@@ -124,7 +137,10 @@ func (c *Collector) writeMDBSystemInfo(dir string) {
 
 	var content string
 	for _, s := range sections {
-		cmd := exec.Command(s.name, s.args...)
+		if ctx.Err() != nil {
+			return
+		}
+		cmd := exec.CommandContext(ctx, s.name, s.args...)
 		output, err := cmd.CombinedOutput()
 		if err != nil {
 			content += fmt.Sprintf("=== %s ===\nERROR: %v\n\n", s.header, err)
@@ -142,10 +158,13 @@ func (c *Collector) writeMDBSystemInfo(dir string) {
 	}
 }
 
-func writeCommandOutput(dir, filename string, name string, args ...string) {
-	cmd := exec.Command(name, args...)
+func writeCommandOutput(ctx context.Context, dir, filename string, name string, args ...string) {
+	cmd := exec.CommandContext(ctx, name, args...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
+		if ctx.Err() != nil {
+			return
+		}
 		log.Printf("Failed to collect %s: %v", filename, err)
 		output = []byte(fmt.Sprintf("ERROR: %v\n%s", err, string(output)))
 	}

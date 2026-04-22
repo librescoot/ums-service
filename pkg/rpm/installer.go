@@ -24,7 +24,10 @@ func New(dbcInterface *dbc.Interface) *Installer {
 	}
 }
 
-func (i *Installer) PrepareUSB(usbMountPath string) error {
+func (i *Installer) PrepareUSB(ctx context.Context, usbMountPath string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	mdbDir := filepath.Join(usbMountPath, "rpms", "mdb")
 	if err := os.MkdirAll(mdbDir, 0755); err != nil {
 		return fmt.Errorf("failed to create rpms/mdb directory: %w", err)

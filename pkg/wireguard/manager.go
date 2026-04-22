@@ -1,6 +1,7 @@
 package wireguard
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
@@ -18,7 +19,10 @@ func New() *Manager {
 	}
 }
 
-func (m *Manager) PrepareUSB(usbMountPath string) error {
+func (m *Manager) PrepareUSB(ctx context.Context, usbMountPath string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	wgDir := filepath.Join(usbMountPath, "wireguard")
 	if err := os.MkdirAll(wgDir, 0755); err != nil {
 		return fmt.Errorf("failed to create wireguard directory: %w", err)
@@ -27,7 +31,10 @@ func (m *Manager) PrepareUSB(usbMountPath string) error {
 	return nil
 }
 
-func (m *Manager) CopyToUSB(usbMountPath string) error {
+func (m *Manager) CopyToUSB(ctx context.Context, usbMountPath string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	// Ensure config directory exists
 	if _, err := os.Stat(m.configDir); os.IsNotExist(err) {
 		log.Printf("WireGuard config directory %s does not exist, skipping", m.configDir)
@@ -75,7 +82,10 @@ func (m *Manager) CopyToUSB(usbMountPath string) error {
 	return nil
 }
 
-func (m *Manager) SyncFromUSB(usbMountPath string) (bool, error) {
+func (m *Manager) SyncFromUSB(ctx context.Context, usbMountPath string) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	srcDir := filepath.Join(usbMountPath, "wireguard")
 
 	// Check if USB wireguard directory exists

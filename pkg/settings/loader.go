@@ -1,6 +1,7 @@
 package settings
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
@@ -19,7 +20,10 @@ func New() *Loader {
 	}
 }
 
-func (l *Loader) CopyToUSB(usbMountPath string) error {
+func (l *Loader) CopyToUSB(ctx context.Context, usbMountPath string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if _, err := os.Stat(l.settingsFile); os.IsNotExist(err) {
 		log.Printf("Settings file %s does not exist, skipping", l.settingsFile)
 		return nil
@@ -40,7 +44,10 @@ func (l *Loader) CopyToUSB(usbMountPath string) error {
 	return nil
 }
 
-func (l *Loader) CopyFromUSB(usbMountPath string) (bool, error) {
+func (l *Loader) CopyFromUSB(ctx context.Context, usbMountPath string) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	srcPath := filepath.Join(usbMountPath, "settings.toml")
 
 	if _, err := os.Stat(srcPath); os.IsNotExist(err) {

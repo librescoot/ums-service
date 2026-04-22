@@ -31,7 +31,10 @@ func New(client *ipc.Client, dbcInterface *dbc.Interface) *Loader {
 	}
 }
 
-func (l *Loader) PrepareUSB(usbMountPath string) error {
+func (l *Loader) PrepareUSB(ctx context.Context, usbMountPath string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	updateDir := filepath.Join(usbMountPath, "system-update")
 	if err := os.MkdirAll(updateDir, 0755); err != nil {
 		return fmt.Errorf("failed to create system-update directory: %w", err)
