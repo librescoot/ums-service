@@ -9,19 +9,16 @@ import (
 func (s *Service) startBrakeExitListener() error {
 	_, err := ipc.Subscribe(s.client, "input-events", func(event string) error {
 		s.mu.Lock()
-		currentMode := s.usbCtrl.GetCurrentMode()
+		cur := s.currentOp
+		active := cur != nil && isUMSTarget(cur.target)
 		s.mu.Unlock()
 
-		if currentMode != "ums" {
+		if !active {
 			return nil
 		}
 
 		log.Println("Left brake hold detected, exiting UMS mode")
-
-		s.mu.Lock()
-		s.doSwitchToNormal()
-		s.mu.Unlock()
-
+		s.exitToNormal()
 		return nil
 	})
 	return err
