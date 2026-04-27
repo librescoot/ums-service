@@ -24,7 +24,7 @@ type Loader struct {
 
 func New(client *ipc.Client, dbcInterface *dbc.Interface) *Loader {
 	return &Loader{
-		otaDir:       "/data/ota",
+		otaDir:       "/data/ota/mdb",
 		dbcOtaDir:    "/data/ota/dbc",
 		client:       client,
 		dbcInterface: dbcInterface,
@@ -65,7 +65,7 @@ func (l *Loader) ProcessUpdates(ctx context.Context, perFileTimeout time.Duratio
 		srcPath := filepath.Join(updateDir, filename)
 
 		if strings.Contains(filename, "-mdb") {
-			if err := l.processMDBUpdate(srcPath); err != nil {
+			if err := l.processMDBUpdate(logger, srcPath); err != nil {
 				return fmt.Errorf("failed to process MDB update: %w", err)
 			}
 		} else if strings.Contains(filename, "-dbc") {
@@ -78,9 +78,12 @@ func (l *Loader) ProcessUpdates(ctx context.Context, perFileTimeout time.Duratio
 	return nil
 }
 
-func (l *Loader) processMDBUpdate(srcPath string) error {
+func (l *Loader) processMDBUpdate(logger *umslog.Logger, srcPath string) error {
 	filename := filepath.Base(srcPath)
 	log.Printf("Processing MDB update: %s", filename)
+	if logger != nil {
+		logger.Logf("updates", "copying MDB update %s", filename)
+	}
 
 	if err := os.MkdirAll(l.otaDir, 0755); err != nil {
 		return fmt.Errorf("failed to create OTA directory: %w", err)
@@ -99,6 +102,9 @@ func (l *Loader) processMDBUpdate(srcPath string) error {
 	}
 
 	log.Printf("Successfully queued MDB update: %s", filename)
+	if logger != nil {
+		logger.Logf("updates", "queued MDB update %s -> %s", filename, dstPath)
+	}
 	return nil
 }
 
@@ -164,5 +170,8 @@ func (l *Loader) processDBCUpdate(ctx context.Context, timeout time.Duration, lo
 	l.dbcInterface.MarkDBCUpdateQueued()
 
 	log.Printf("Successfully queued DBC update: %s", filename)
+	if logger != nil {
+		logger.Logf("updates", "queued DBC update %s -> %s", filename, remotePath)
+	}
 	return nil
 }
