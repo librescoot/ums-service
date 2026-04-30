@@ -77,36 +77,67 @@ When in UMS mode, the virtual drive contains:
 
 ```
 /
-├── settings.toml        # Device settings (if exists)
-├── wireguard/          # WireGuard VPN configs
+├── settings.toml        # Device settings (bidirectional)
+├── onboot.sh            # User boot script (bidirectional, validated on copy-back)
+├── wireguard/           # WireGuard VPN configs (bidirectional)
 │   └── *.conf
-├── system-update/       # Place .mender files here
+├── radio-gaga/
+│   └── config.yaml      # Telemetry uplink config (bidirectional)
+├── uplink-service/
+│   └── config.yaml      # Uplink service config (bidirectional)
+├── system-update/       # Place .mender files here (write-in only)
 │   ├── librescoot-mdb-*.mender
 │   └── librescoot-dbc-*.mender
-└── maps/               # Place map files here
-    ├── *.mbtiles
-    └── *tiles.tar or valhalla_tiles_*.tar
+├── maps/                # Place map files here (write-in only)
+│   ├── *.mbtiles
+│   └── *tiles.tar or valhalla_tiles_*.tar
+├── log-bundles/         # Saved diagnostic bundles from `lsc logs` (read-only)
+│   └── logs-*.tar.gz
+└── diagnostics/         # Live system info captured each cycle (read-only)
+    ├── mdb/
+    └── dbc/
 ```
+
+## Startup & post-cycle cleanup
+
+On boot and again after every UMS cycle, ums-service performs housekeeping:
+
+- **Log bundles**: keep only the 10 most recent `/data/log-bundles/logs-*.tar.gz`.
+- **OTA artifacts**:
+  - Remove any `*.mender` / `*.delta` outside the managed dirs (`mdb`, `dbc`, `mdb-boot`, `dbc-boot`).
+  - In `mdb/` and `dbc/`, keep only the newest version per channel group (semver-aware for v-prefixed stable versions, lexicographic for ISO-timestamped nightly/testing).
+  - In `mdb-boot/` and `dbc-boot/`, keep the 5 newest per group.
+
+Post-cycle cleanup skips pruning of `/data/ota/{mdb,dbc}` because update-service installs queued .mender files asynchronously after our LPush; the next boot's full cleanup sweeps them.
 
 ## File Processing
 
 ### When switching to UMS mode:
 1. Copies `/data/settings.toml` to USB drive (if exists)
 2. Copies `/data/wireguard/*.conf` to USB `wireguard/` directory
-3. Creates `system-update` and `maps` directories
+3. Copies `/data/radio-gaga/config.yaml` to USB `radio-gaga/` directory
+4. Copies `/data/uplink-service/config.yaml` to USB `uplink-service/` directory
+5. Copies `/data/onboot.sh` to USB drive (if exists)
+6. Copies `/data/log-bundles/logs-*.tar.gz` to USB `log-bundles/` directory
+7. Creates `system-update` and `maps` directories
+8. Captures live diagnostics into USB `diagnostics/` directory
 
 ### When switching to normal mode:
-1. **Settings**: Copies settings.toml back and restarts settings-service
-2. **WireGuard**: 
+1. **Settings**: Copies settings.toml back; restarts settings-service if changed
+2. **WireGuard**:
    - Syncs *.conf files from USB to `/data/wireguard/`
    - Removes local configs not present on USB
-   - Restarts settings-service if any changes made
-3. **Updates**: 
+   - Restarts settings-service if changed
+3. **radio-gaga**: Copies USB `radio-gaga/config.yaml` back; restarts `radio-gaga.service` if changed
+4. **uplink-service**: Copies USB `uplink-service/config.yaml` back; restarts `librescoot-uplink.service` if changed
+5. **onboot.sh**: Validates shebang and shell syntax (`<interp> -n`, falling back to `/bin/sh -n`); installs and chmods +x if valid, otherwise leaves the existing script untouched
+6. **Updates**:
    - MDB updates: Installs locally and marks for reboot
    - DBC updates: Transfers to DBC and installs remotely
-4. **Maps**: Transfers map files to DBC
-5. Cleans the USB drive
-6. Reboots if required by updates
+7. **Maps**: Transfers map files to DBC
+8. Runs post-cycle cleanup (see above)
+9. Cleans the USB drive
+10. Reboots if required by updates
 
 ## Building
 
@@ -139,8 +170,12 @@ sudo ./bin/ums-service
 
 - Virtual USB drive: `/data/usb.drive`
 - Settings: `/data/settings.toml`
+- Boot script: `/data/onboot.sh`
 - WireGuard configs: `/data/wireguard/`
-- Updates: `/data/ota/`
+- radio-gaga config: `/data/radio-gaga/config.yaml`
+- uplink-service config: `/data/uplink-service/config.yaml`
+- Updates: `/data/ota/{mdb,dbc,mdb-boot,dbc-boot}/`
+- Log bundles: `/data/log-bundles/logs-*.tar.gz`
 - DBC files: `/data/dbc/`
 
 ## Dashboard Computer (DBC)

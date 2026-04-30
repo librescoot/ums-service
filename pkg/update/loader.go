@@ -7,6 +7,8 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -16,19 +18,224 @@ import (
 )
 
 type Loader struct {
+	otaRootDir   string
 	otaDir       string
 	dbcOtaDir    string
+	managedDirs  []managedDir
 	client       *ipc.Client
 	dbcInterface *dbc.Interface
 }
 
+// managedDir is a subdirectory under /data/ota that ums-service is allowed to
+// keep update artifacts in. `keep` is the number of most-recent versions to
+// retain per (channel) group during cleanup.
+type managedDir struct {
+	path string
+	keep int
+}
+
 func New(client *ipc.Client, dbcInterface *dbc.Interface) *Loader {
+	otaDir := "/data/ota/mdb"
+	dbcOtaDir := "/data/ota/dbc"
 	return &Loader{
-		otaDir:       "/data/ota/mdb",
-		dbcOtaDir:    "/data/ota/dbc",
+		otaRootDir: "/data/ota",
+		otaDir:     otaDir,
+		dbcOtaDir:  dbcOtaDir,
+		managedDirs: []managedDir{
+			{otaDir, 1},
+			{dbcOtaDir, 1},
+			{"/data/ota/mdb-boot", 5},
+			{"/data/ota/dbc-boot", 5},
+		},
 		client:       client,
 		dbcInterface: dbcInterface,
 	}
+}
+
+// CleanupStaleFiles removes orphaned update artifacts under /data/ota:
+//   - Any *.mender or *.delta file NOT inside one of the managed subdirs is removed.
+//   - Inside each managed subdir, files are grouped by name prefix (everything
+//     up to the trailing version token) and only the newest N versions per
+//     group are kept (1 for mdb/dbc, 5 for mdb-boot/dbc-boot).
+//
+// Version comparison is semver-aware for v-prefixed versions (e.g. v0.10.0 >
+// v0.7.0); otherwise lexicographic, which works for ISO timestamps used by the
+// nightly/testing channels.
+func (l *Loader) CleanupStaleFiles() error {
+	return l.cleanup(nil)
+}
+
+// CleanupStaleFilesPostCycle is the variant run at the end of a UMS cycle.
+// It skips pruning of mdb/ and dbc/ because update-service installs queued
+// .mender files asynchronously after our LPush, and we must not delete the
+// file out from under the in-flight install. The next boot's full
+// CleanupStaleFiles will sweep them.
+func (l *Loader) CleanupStaleFilesPostCycle() error {
+	return l.cleanup(map[string]bool{
+		filepath.Clean(l.otaDir):    true,
+		filepath.Clean(l.dbcOtaDir): true,
+	})
+}
+
+func (l *Loader) cleanup(skipPrune map[string]bool) error {
+	if _, err := os.Stat(l.otaRootDir); os.IsNotExist(err) {
+		return nil
+	}
+
+	if err := l.removeOrphanedUpdateFiles(); err != nil {
+		log.Printf("ota cleanup: orphan sweep failed: %v", err)
+	}
+
+	for _, md := range l.managedDirs {
+		if skipPrune[filepath.Clean(md.path)] {
+			continue
+		}
+		if err := l.pruneOldVersions(md.path, md.keep); err != nil {
+			log.Printf("ota cleanup: pruning %s failed: %v", md.path, err)
+		}
+	}
+	return nil
+}
+
+func (l *Loader) removeOrphanedUpdateFiles() error {
+	allowedDirs := make(map[string]bool, len(l.managedDirs))
+	for _, d := range l.managedDirs {
+		allowedDirs[filepath.Clean(d.path)] = true
+	}
+
+	return filepath.Walk(l.otaRootDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		if info.IsDir() {
+			return nil
+		}
+		if !isUpdateFile(info.Name()) {
+			return nil
+		}
+		if allowedDirs[filepath.Clean(filepath.Dir(path))] {
+			return nil
+		}
+		if rmErr := os.Remove(path); rmErr != nil {
+			log.Printf("ota cleanup: failed to remove orphaned %s: %v", path, rmErr)
+			return nil
+		}
+		log.Printf("ota cleanup: removed orphaned update file %s", path)
+		return nil
+	})
+}
+
+func (l *Loader) pruneOldVersions(dir string, keep int) error {
+	if keep < 1 {
+		keep = 1
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+
+	groups := make(map[string][]string)
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if !isUpdateFile(name) {
+			continue
+		}
+		key, _ := splitVersion(name)
+		groups[key] = append(groups[key], name)
+	}
+
+	for _, files := range groups {
+		if len(files) <= keep {
+			continue
+		}
+		sort.Slice(files, func(i, j int) bool {
+			_, vi := splitVersion(files[i])
+			_, vj := splitVersion(files[j])
+			return compareVersions(vi, vj) < 0
+		})
+		// Keep `keep` newest (tail of the sorted slice); remove the rest.
+		for _, old := range files[:len(files)-keep] {
+			path := filepath.Join(dir, old)
+			if err := os.Remove(path); err != nil {
+				log.Printf("ota cleanup: failed to remove old %s: %v", path, err)
+				continue
+			}
+			log.Printf("ota cleanup: removed old update %s", path)
+		}
+	}
+	return nil
+}
+
+func isUpdateFile(name string) bool {
+	return strings.HasSuffix(name, ".mender") || strings.HasSuffix(name, ".delta")
+}
+
+// splitVersion splits "librescoot-foo-mdb-nightly-20260429T102607.mender" into
+// ("librescoot-foo-mdb-nightly", "20260429T102607"). The version token is the
+// segment after the last '-' (extension stripped).
+func splitVersion(filename string) (key, version string) {
+	base := filename
+	for _, ext := range []string{".mender", ".delta"} {
+		if trimmed, ok := strings.CutSuffix(base, ext); ok {
+			base = trimmed
+			break
+		}
+	}
+	idx := strings.LastIndex(base, "-")
+	if idx < 0 {
+		return base, ""
+	}
+	return base[:idx], base[idx+1:]
+}
+
+// compareVersions returns -1, 0, or 1. Treats v-prefixed dotted versions as
+// semver, everything else as lexicographic (works for ISO timestamps).
+func compareVersions(a, b string) int {
+	aSemver, aParts := parseSemver(a)
+	bSemver, bParts := parseSemver(b)
+	if aSemver && bSemver {
+		for i := range 3 {
+			if aParts[i] != bParts[i] {
+				if aParts[i] < bParts[i] {
+					return -1
+				}
+				return 1
+			}
+		}
+		return 0
+	}
+	switch {
+	case a < b:
+		return -1
+	case a > b:
+		return 1
+	}
+	return 0
+}
+
+func parseSemver(v string) (bool, [3]int) {
+	var out [3]int
+	if !strings.HasPrefix(v, "v") {
+		return false, out
+	}
+	parts := strings.Split(strings.TrimPrefix(v, "v"), ".")
+	if len(parts) != 3 {
+		return false, out
+	}
+	for i, p := range parts {
+		n, err := strconv.Atoi(p)
+		if err != nil {
+			return false, out
+		}
+		out[i] = n
+	}
+	return true, out
 }
 
 func (l *Loader) PrepareUSB(usbMountPath string) error {

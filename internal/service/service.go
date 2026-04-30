@@ -17,34 +17,44 @@ import (
 	"github.com/librescoot/ums-service/pkg/dbc"
 	"github.com/librescoot/ums-service/pkg/diagnostics"
 	"github.com/librescoot/ums-service/pkg/disk"
+	"github.com/librescoot/ums-service/pkg/logbundles"
 	"github.com/librescoot/ums-service/pkg/maps"
+	"github.com/librescoot/ums-service/pkg/onboot"
+	"github.com/librescoot/ums-service/pkg/radiogaga"
 	"github.com/librescoot/ums-service/pkg/rpm"
 	"github.com/librescoot/ums-service/pkg/scripts"
 	"github.com/librescoot/ums-service/pkg/settings"
 	"github.com/librescoot/ums-service/pkg/umslog"
 	"github.com/librescoot/ums-service/pkg/update"
+	"github.com/librescoot/ums-service/pkg/uplink"
 	"github.com/librescoot/ums-service/pkg/usb"
 	"github.com/librescoot/ums-service/pkg/wireguard"
 )
 
+const logBundleKeepCount = 10
+
 type Service struct {
-	config       *config.Config
-	client       *ipc.Client
-	watcher      *ipc.HashWatcher
-	publisher    *ipc.HashPublisher
-	usbCtrl      *usb.Controller
-	diskMgr      *disk.Manager
-	dbcInterface *dbc.Interface
-	settingsLdr  *settings.Loader
-	updateLdr    *update.Loader
-	mapsUpdater  *maps.Updater
-	wgManager    *wireguard.Manager
-	diagnostics  *diagnostics.Collector
-	rpmInstaller *rpm.Installer
-	scriptRunner *scripts.Runner
-	mu           sync.Mutex
-	detachCount  int
-	umsModeType  string
+	config        *config.Config
+	client        *ipc.Client
+	watcher       *ipc.HashWatcher
+	publisher     *ipc.HashPublisher
+	usbCtrl       *usb.Controller
+	diskMgr       *disk.Manager
+	dbcInterface  *dbc.Interface
+	settingsLdr   *settings.Loader
+	updateLdr     *update.Loader
+	mapsUpdater   *maps.Updater
+	wgManager     *wireguard.Manager
+	diagnostics   *diagnostics.Collector
+	rpmInstaller  *rpm.Installer
+	scriptRunner  *scripts.Runner
+	logBundlesMgr *logbundles.Manager
+	radioGagaMgr  *radiogaga.Manager
+	uplinkMgr     *uplink.Manager
+	onbootMgr     *onboot.Manager
+	mu            sync.Mutex
+	detachCount   int
+	umsModeType   string
 }
 
 func New(cfg *config.Config) (*Service, error) {
@@ -75,20 +85,24 @@ func New(cfg *config.Config) (*Service, error) {
 	scriptRunner := scripts.New(dbcInterface)
 
 	svc := &Service{
-		config:       cfg,
-		client:       client,
-		watcher:      client.NewHashWatcher("usb"),
-		publisher:    client.NewHashPublisher("usb"),
-		usbCtrl:      usbCtrl,
-		diskMgr:      diskMgr,
-		dbcInterface: dbcInterface,
-		settingsLdr:  settingsLdr,
-		updateLdr:    updateLdr,
-		mapsUpdater:  mapsUpdater,
-		wgManager:    wgManager,
-		diagnostics:  diagnostics.New(),
-		rpmInstaller: rpmInstaller,
-		scriptRunner: scriptRunner,
+		config:        cfg,
+		client:        client,
+		watcher:       client.NewHashWatcher("usb"),
+		publisher:     client.NewHashPublisher("usb"),
+		usbCtrl:       usbCtrl,
+		diskMgr:       diskMgr,
+		dbcInterface:  dbcInterface,
+		settingsLdr:   settingsLdr,
+		updateLdr:     updateLdr,
+		mapsUpdater:   mapsUpdater,
+		wgManager:     wgManager,
+		diagnostics:   diagnostics.New(),
+		rpmInstaller:  rpmInstaller,
+		scriptRunner:  scriptRunner,
+		logBundlesMgr: logbundles.New(),
+		radioGagaMgr:  radiogaga.New(),
+		uplinkMgr:     uplink.New(),
+		onbootMgr:     onboot.New(),
 	}
 
 	svc.watcher.OnField("mode", svc.handleModeChange)
@@ -121,6 +135,8 @@ func (s *Service) Run(ctx context.Context) error {
 	if err := s.diskMgr.Initialize(); err != nil {
 		return fmt.Errorf("failed to initialize disk manager: %w", err)
 	}
+
+	s.runStartupCleanup()
 
 	s.usbCtrl.StartMonitoring()
 
@@ -212,6 +228,31 @@ func (s *Service) switchToUMS(mode string) error {
 		log.Printf("Error copying wireguard configs to USB: %v", err)
 	}
 
+	if err := s.radioGagaMgr.PrepareUSB(mountPoint); err != nil {
+		log.Printf("Error preparing radio-gaga directory: %v", err)
+	}
+	if err := s.radioGagaMgr.CopyToUSB(mountPoint); err != nil {
+		log.Printf("Error copying radio-gaga config to USB: %v", err)
+	}
+
+	if err := s.uplinkMgr.PrepareUSB(mountPoint); err != nil {
+		log.Printf("Error preparing uplink-service directory: %v", err)
+	}
+	if err := s.uplinkMgr.CopyToUSB(mountPoint); err != nil {
+		log.Printf("Error copying uplink-service config to USB: %v", err)
+	}
+
+	if err := s.onbootMgr.CopyToUSB(mountPoint); err != nil {
+		log.Printf("Error copying onboot.sh to USB: %v", err)
+	}
+
+	if err := s.logBundlesMgr.PrepareUSB(mountPoint); err != nil {
+		log.Printf("Error preparing log-bundles directory: %v", err)
+	}
+	if err := s.logBundlesMgr.CopyToUSB(mountPoint); err != nil {
+		log.Printf("Error copying log bundles to USB: %v", err)
+	}
+
 	s.diagnostics.CollectToUSB(mountPoint)
 
 	if err := s.rpmInstaller.PrepareUSB(mountPoint); err != nil {
@@ -299,6 +340,34 @@ func (s *Service) switchToNormal(prevMode string) error {
 		wgChanged = changed
 	}
 
+	s.setStep("radio-gaga")
+	radioGagaChanged := false
+	if changed, err := s.radioGagaMgr.CopyFromUSB(mountPoint); err != nil {
+		logger.Error("radio-gaga", "%v", err)
+		log.Printf("Error processing radio-gaga config: %v", err)
+	} else {
+		logger.Logf("radio-gaga", "done (changed=%v)", changed)
+		radioGagaChanged = changed
+	}
+
+	s.setStep("uplink-service")
+	uplinkChanged := false
+	if changed, err := s.uplinkMgr.CopyFromUSB(mountPoint); err != nil {
+		logger.Error("uplink-service", "%v", err)
+		log.Printf("Error processing uplink-service config: %v", err)
+	} else {
+		logger.Logf("uplink-service", "done (changed=%v)", changed)
+		uplinkChanged = changed
+	}
+
+	s.setStep("onboot")
+	if changed, err := s.onbootMgr.CopyFromUSB(mountPoint); err != nil {
+		logger.Error("onboot", "%v", err)
+		log.Printf("Error processing onboot.sh: %v", err)
+	} else {
+		logger.Logf("onboot", "done (changed=%v)", changed)
+	}
+
 	s.setStep("updates")
 	if err := s.updateLdr.ProcessUpdates(ctx, s.config.MenderTransferTimeout, logger, mountPoint); err != nil {
 		logger.Error("updates", "%v", err)
@@ -332,20 +401,20 @@ func (s *Service) switchToNormal(prevMode string) error {
 	logger.ClearProgress()
 
 	if settingsChanged || wgChanged {
-		log.Println("Configuration changed, restarting settings-service")
-		cmd := exec.Command("systemctl", "restart", "settings-service")
-		if output, err := cmd.CombinedOutput(); err != nil {
-			logger.Error("settings-service", "restart failed: %v", err)
-			log.Printf("Failed to restart settings-service: %v, output: %s", err, string(output))
-		} else {
-			logger.Logf("settings-service", "restarted")
-			log.Println("Successfully restarted settings-service")
-		}
+		restartUnit(logger, "settings-service")
+	}
+	if radioGagaChanged {
+		restartUnit(logger, "radio-gaga.service")
+	}
+	if uplinkChanged {
+		restartUnit(logger, "librescoot-uplink.service")
 	}
 
 	if err := logger.WriteToFile(filepath.Join(mountPoint, "ums_log.txt")); err != nil {
 		log.Printf("Error writing log file: %v", err)
 	}
+
+	s.runPostCycleCleanup()
 
 	if err := s.diskMgr.CleanDrive(); err != nil {
 		log.Printf("Error cleaning USB drive: %v", err)
@@ -514,4 +583,39 @@ func (s *Service) setStep(step string) {
 	if err := s.publisher.Set("step", step, ipc.Sync()); err != nil {
 		log.Printf("Error publishing usb step %q: %v", step, err)
 	}
+}
+
+func (s *Service) runStartupCleanup() {
+	if err := s.logBundlesMgr.PruneOldBundles(logBundleKeepCount); err != nil {
+		log.Printf("Warning: failed to prune old log bundles: %v", err)
+	}
+	if err := s.updateLdr.CleanupStaleFiles(); err != nil {
+		log.Printf("Warning: failed to clean up stale OTA files: %v", err)
+	}
+}
+
+// runPostCycleCleanup runs after a UMS cycle has finished applying USB content.
+// It skips pruning of /data/ota/{mdb,dbc} because update-service may still be
+// installing the .mender we just queued there; the next boot's full cleanup
+// will sweep those.
+func (s *Service) runPostCycleCleanup() {
+	if err := s.logBundlesMgr.PruneOldBundles(logBundleKeepCount); err != nil {
+		log.Printf("Warning: failed to prune old log bundles: %v", err)
+	}
+	if err := s.updateLdr.CleanupStaleFilesPostCycle(); err != nil {
+		log.Printf("Warning: failed to clean up stale OTA files: %v", err)
+	}
+}
+
+func restartUnit(logger *umslog.Logger, unit string) {
+	log.Printf("Restarting %s", unit)
+	cmd := exec.Command("systemctl", "restart", unit)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		logger.Error(unit, "restart failed: %v", err)
+		log.Printf("Failed to restart %s: %v, output: %s", unit, err, string(output))
+		return
+	}
+	logger.Logf(unit, "restarted")
+	log.Printf("Successfully restarted %s", unit)
 }
