@@ -44,7 +44,10 @@ func TestSplitVersion(t *testing.T) {
 	}
 }
 
-// TestCleanupStaleFiles exercises the full sweep against a temp /data/ota tree.
+// TestCleanupStaleFiles exercises the sweep against a temp /data/ota tree.
+// /data/ota/{mdb,dbc} are owned by update-service and must never be pruned by
+// ums-service: their files (including older delta-base .mender artifacts)
+// must survive untouched.
 func TestCleanupStaleFiles(t *testing.T) {
 	root := t.TempDir()
 	mdb := filepath.Join(root, "mdb")
@@ -65,7 +68,7 @@ func TestCleanupStaleFiles(t *testing.T) {
 		}
 	}
 
-	// mdb: 3 stable semver + 3 nightly timestamps; expect newest of each kept.
+	// mdb: multiple stable + nightly artifacts; ALL must survive (update-service owns this dir).
 	must(filepath.Join(mdb, "librescoot-foo-mdb-stable-v0.7.0.mender"))
 	must(filepath.Join(mdb, "librescoot-foo-mdb-stable-v0.8.0.mender"))
 	must(filepath.Join(mdb, "librescoot-foo-mdb-stable-v0.10.0.mender"))
@@ -75,7 +78,11 @@ func TestCleanupStaleFiles(t *testing.T) {
 	// non-update file in mdb stays
 	must(filepath.Join(mdb, "notes.txt"))
 
-	// mdb-boot: 7 entries, expect newest 5 kept
+	// dbc: same — all must survive.
+	must(filepath.Join(dbc, "librescoot-foo-dbc-stable-v0.7.0.mender"))
+	must(filepath.Join(dbc, "librescoot-foo-dbc-stable-v0.10.0.mender"))
+
+	// mdb-boot: 7 entries, expect newest 5 kept (boot dirs are still pruned).
 	for _, day := range []string{"01", "02", "03", "04", "05", "06", "07"} {
 		must(filepath.Join(mdbBoot, "librescoot-mdb-boot-nightly-202601"+day+"T120000.mender"))
 	}
@@ -109,6 +116,8 @@ func TestCleanupStaleFiles(t *testing.T) {
 	want := []string{
 		"dbc",
 		"dbc-boot",
+		"dbc/librescoot-foo-dbc-stable-v0.10.0.mender",
+		"dbc/librescoot-foo-dbc-stable-v0.7.0.mender",
 		"mdb",
 		"mdb-boot",
 		"mdb-boot/librescoot-mdb-boot-nightly-20260103T120000.mender",
@@ -116,8 +125,12 @@ func TestCleanupStaleFiles(t *testing.T) {
 		"mdb-boot/librescoot-mdb-boot-nightly-20260105T120000.mender",
 		"mdb-boot/librescoot-mdb-boot-nightly-20260106T120000.mender",
 		"mdb-boot/librescoot-mdb-boot-nightly-20260107T120000.mender",
+		"mdb/librescoot-foo-mdb-nightly-20260101T120000.mender",
+		"mdb/librescoot-foo-mdb-nightly-20260229T120000.mender",
 		"mdb/librescoot-foo-mdb-nightly-20260415T120000.mender",
 		"mdb/librescoot-foo-mdb-stable-v0.10.0.mender",
+		"mdb/librescoot-foo-mdb-stable-v0.7.0.mender",
+		"mdb/librescoot-foo-mdb-stable-v0.8.0.mender",
 		"mdb/notes.txt",
 		"random",
 		"some.service",
@@ -127,63 +140,6 @@ func TestCleanupStaleFiles(t *testing.T) {
 	sort.Strings(want)
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Errorf("post-cleanup tree mismatch.\ngot:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
-	}
-}
-
-func TestCleanupStaleFilesPostCycleSkipsMdbDbc(t *testing.T) {
-	root := t.TempDir()
-	mdb := filepath.Join(root, "mdb")
-	dbc := filepath.Join(root, "dbc")
-	mdbBoot := filepath.Join(root, "mdb-boot")
-	dbcBoot := filepath.Join(root, "dbc-boot")
-	for _, d := range []string{mdb, dbc, mdbBoot, dbcBoot} {
-		if err := os.MkdirAll(d, 0755); err != nil {
-			t.Fatal(err)
-		}
-	}
-	must := func(p string) {
-		if err := os.WriteFile(p, []byte("x"), 0644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	must(filepath.Join(mdb, "librescoot-foo-mdb-stable-v0.7.0.mender"))
-	must(filepath.Join(mdb, "librescoot-foo-mdb-stable-v0.10.0.mender"))
-	must(filepath.Join(root, "loose.mender"))
-	for _, day := range []string{"01", "02", "03", "04", "05", "06", "07"} {
-		must(filepath.Join(mdbBoot, "librescoot-mdb-boot-nightly-202601"+day+"T120000.mender"))
-	}
-
-	l := &Loader{
-		otaRootDir: root,
-		otaDir:     mdb,
-		dbcOtaDir:  dbc,
-		managedDirs: []managedDir{
-			{mdb, 1},
-			{dbc, 1},
-			{mdbBoot, 5},
-			{dbcBoot, 5},
-		},
-	}
-	if err := l.CleanupStaleFilesPostCycle(); err != nil {
-		t.Fatalf("CleanupStaleFilesPostCycle: %v", err)
-	}
-
-	if _, err := os.Stat(filepath.Join(root, "loose.mender")); !os.IsNotExist(err) {
-		t.Errorf("orphan loose.mender should be removed")
-	}
-	// Both mdb files preserved (no pruning post-cycle)
-	for _, p := range []string{
-		filepath.Join(mdb, "librescoot-foo-mdb-stable-v0.7.0.mender"),
-		filepath.Join(mdb, "librescoot-foo-mdb-stable-v0.10.0.mender"),
-	} {
-		if _, err := os.Stat(p); err != nil {
-			t.Errorf("mdb file %s was unexpectedly removed: %v", filepath.Base(p), err)
-		}
-	}
-	// mdb-boot pruned to 5 (post-cycle still prunes boot dirs)
-	entries, _ := os.ReadDir(mdbBoot)
-	if len(entries) != 5 {
-		t.Errorf("mdb-boot should have 5 entries, got %d", len(entries))
 	}
 }
 

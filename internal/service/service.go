@@ -595,14 +595,11 @@ func (s *Service) runStartupCleanup() {
 }
 
 // runPostCycleCleanup runs after a UMS cycle has finished applying USB content.
-// It skips pruning of /data/ota/{mdb,dbc} because update-service may still be
-// installing the .mender we just queued there; the next boot's full cleanup
-// will sweep those.
 func (s *Service) runPostCycleCleanup() {
 	if err := s.logBundlesMgr.PruneOldBundles(logBundleKeepCount); err != nil {
 		log.Printf("Warning: failed to prune old log bundles: %v", err)
 	}
-	if err := s.updateLdr.CleanupStaleFilesPostCycle(); err != nil {
+	if err := s.updateLdr.CleanupStaleFiles(); err != nil {
 		log.Printf("Warning: failed to clean up stale OTA files: %v", err)
 	}
 }

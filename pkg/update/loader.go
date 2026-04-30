@@ -54,30 +54,19 @@ func New(client *ipc.Client, dbcInterface *dbc.Interface) *Loader {
 
 // CleanupStaleFiles removes orphaned update artifacts under /data/ota:
 //   - Any *.mender or *.delta file NOT inside one of the managed subdirs is removed.
-//   - Inside each managed subdir, files are grouped by name prefix (everything
-//     up to the trailing version token) and only the newest N versions per
-//     group are kept (1 for mdb/dbc, 5 for mdb-boot/dbc-boot).
+//   - Inside the boot subdirs (mdb-boot, dbc-boot) only the newest N versions
+//     per channel group are kept.
+//
+// /data/ota/mdb and /data/ota/dbc are owned by update-service: they hold the
+// previously-installed .mender (delta base) and any in-flight download.
+// ums-service must not prune them — update-service has its own retention
+// policy and a concurrent prune here would race with downloads/installs and
+// can delete the delta base out from under it.
 //
 // Version comparison is semver-aware for v-prefixed versions (e.g. v0.10.0 >
 // v0.7.0); otherwise lexicographic, which works for ISO timestamps used by the
 // nightly/testing channels.
 func (l *Loader) CleanupStaleFiles() error {
-	return l.cleanup(nil)
-}
-
-// CleanupStaleFilesPostCycle is the variant run at the end of a UMS cycle.
-// It skips pruning of mdb/ and dbc/ because update-service installs queued
-// .mender files asynchronously after our LPush, and we must not delete the
-// file out from under the in-flight install. The next boot's full
-// CleanupStaleFiles will sweep them.
-func (l *Loader) CleanupStaleFilesPostCycle() error {
-	return l.cleanup(map[string]bool{
-		filepath.Clean(l.otaDir):    true,
-		filepath.Clean(l.dbcOtaDir): true,
-	})
-}
-
-func (l *Loader) cleanup(skipPrune map[string]bool) error {
 	if _, err := os.Stat(l.otaRootDir); os.IsNotExist(err) {
 		return nil
 	}
@@ -86,6 +75,10 @@ func (l *Loader) cleanup(skipPrune map[string]bool) error {
 		log.Printf("ota cleanup: orphan sweep failed: %v", err)
 	}
 
+	skipPrune := map[string]bool{
+		filepath.Clean(l.otaDir):    true,
+		filepath.Clean(l.dbcOtaDir): true,
+	}
 	for _, md := range l.managedDirs {
 		if skipPrune[filepath.Clean(md.path)] {
 			continue
