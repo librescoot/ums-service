@@ -35,7 +35,7 @@ const (
 	// PUT at absolute paths (PUT /data/maps/foo writes /data/maps/foo).
 	uploadServerBootstrapped
 	// uploadServerDataServer is librescoot-data-server running as a
-	// long-lived service on the DBC (newer LibreScoot images). Accepts
+	// long-lived service on the DBC (newer Librescoot images). Accepts
 	// PUT at paths relative to its -data dir (PUT /maps/foo writes
 	// <dataDir>/maps/foo). Identified via the `Server:` response header.
 	uploadServerDataServer
