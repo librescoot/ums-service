@@ -34,6 +34,24 @@ type managedDir struct {
 	keep int
 }
 
+// Queued summarizes what ProcessUpdates copied/transferred and what still
+// needs to be pushed to Redis to trigger the install. The caller is
+// responsible for subscribing to the ota hash BEFORE performing
+// PendingPushes, so the awaiter doesn't miss the install→pending-reboot
+// transition.
+type Queued struct {
+	MDB           bool
+	DBC           bool
+	PendingPushes []PendingPush
+}
+
+// PendingPush is an LPush operation deferred so the caller can subscribe
+// to status changes first.
+type PendingPush struct {
+	Channel string
+	Value   string
+}
+
 func New(client *ipc.Client, dbcInterface *dbc.Interface) *Loader {
 	otaDir := "/data/ota/mdb"
 	dbcOtaDir := "/data/ota/dbc"
@@ -240,16 +258,17 @@ func (l *Loader) PrepareUSB(usbMountPath string) error {
 	return nil
 }
 
-func (l *Loader) ProcessUpdates(ctx context.Context, perFileTimeout time.Duration, logger *umslog.Logger, usbMountPath string) error {
+func (l *Loader) ProcessUpdates(ctx context.Context, perFileTimeout time.Duration, logger *umslog.Logger, usbMountPath string) (Queued, error) {
+	var queued Queued
 	updateDir := filepath.Join(usbMountPath, "system-update")
 
 	entries, err := os.ReadDir(updateDir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			log.Println("No system-update directory found")
-			return nil
+			return queued, nil
 		}
-		return fmt.Errorf("failed to read update directory: %w", err)
+		return queued, fmt.Errorf("failed to read update directory: %w", err)
 	}
 
 	for _, entry := range entries {
@@ -265,20 +284,26 @@ func (l *Loader) ProcessUpdates(ctx context.Context, perFileTimeout time.Duratio
 		srcPath := filepath.Join(updateDir, filename)
 
 		if strings.Contains(filename, "-mdb") {
-			if err := l.processMDBUpdate(logger, srcPath); err != nil {
-				return fmt.Errorf("failed to process MDB update: %w", err)
+			push, err := l.processMDBUpdate(logger, srcPath)
+			if err != nil {
+				return queued, fmt.Errorf("failed to process MDB update: %w", err)
 			}
+			queued.MDB = true
+			queued.PendingPushes = append(queued.PendingPushes, push)
 		} else if strings.Contains(filename, "-dbc") {
-			if err := l.processDBCUpdate(ctx, perFileTimeout, logger, srcPath); err != nil {
-				return fmt.Errorf("failed to process DBC update: %w", err)
+			push, err := l.processDBCUpdate(ctx, perFileTimeout, logger, srcPath)
+			if err != nil {
+				return queued, fmt.Errorf("failed to process DBC update: %w", err)
 			}
+			queued.DBC = true
+			queued.PendingPushes = append(queued.PendingPushes, push)
 		}
 	}
 
-	return nil
+	return queued, nil
 }
 
-func (l *Loader) processMDBUpdate(logger *umslog.Logger, srcPath string) error {
+func (l *Loader) processMDBUpdate(logger *umslog.Logger, srcPath string) (PendingPush, error) {
 	filename := filepath.Base(srcPath)
 	log.Printf("Processing MDB update: %s", filename)
 	if logger != nil {
@@ -286,26 +311,24 @@ func (l *Loader) processMDBUpdate(logger *umslog.Logger, srcPath string) error {
 	}
 
 	if err := os.MkdirAll(l.otaDir, 0755); err != nil {
-		return fmt.Errorf("failed to create OTA directory: %w", err)
+		return PendingPush{}, fmt.Errorf("failed to create OTA directory: %w", err)
 	}
 
 	dstPath := filepath.Join(l.otaDir, filename)
 
 	// Copy instead of rename — source is on vfat, destination on ext4
 	if err := copyFile(srcPath, dstPath); err != nil {
-		return fmt.Errorf("failed to copy update file: %w", err)
+		return PendingPush{}, fmt.Errorf("failed to copy update file: %w", err)
 	}
 
-	_, err := l.client.LPush("scooter:update:mdb", fmt.Sprintf("update-from-file:%s", dstPath))
-	if err != nil {
-		return fmt.Errorf("failed to notify update service: %w", err)
-	}
-
-	log.Printf("Successfully queued MDB update: %s", filename)
+	log.Printf("Successfully staged MDB update: %s", filename)
 	if logger != nil {
-		logger.Logf("updates", "queued MDB update %s -> %s", filename, dstPath)
+		logger.Logf("updates", "staged MDB update %s -> %s", filename, dstPath)
 	}
-	return nil
+	return PendingPush{
+		Channel: "scooter:update:mdb",
+		Value:   fmt.Sprintf("update-from-file:%s", dstPath),
+	}, nil
 }
 
 func copyFile(src, dst string) error {
@@ -328,12 +351,12 @@ func copyFile(src, dst string) error {
 	return out.Sync()
 }
 
-func (l *Loader) processDBCUpdate(ctx context.Context, timeout time.Duration, logger *umslog.Logger, srcPath string) error {
+func (l *Loader) processDBCUpdate(ctx context.Context, timeout time.Duration, logger *umslog.Logger, srcPath string) (PendingPush, error) {
 	filename := filepath.Base(srcPath)
 	log.Printf("Processing DBC update: %s", filename)
 
 	if !l.dbcInterface.IsEnabled() {
-		return fmt.Errorf("DBC interface not enabled for update")
+		return PendingPush{}, fmt.Errorf("DBC interface not enabled for update")
 	}
 
 	opCtx, cancel := context.WithTimeout(ctx, timeout)
@@ -342,7 +365,7 @@ func (l *Loader) processDBCUpdate(ctx context.Context, timeout time.Duration, lo
 	remotePath := filepath.Join(l.dbcOtaDir, filename)
 
 	if _, err := l.dbcInterface.RunCommand(opCtx, fmt.Sprintf("mkdir -p %s", l.dbcOtaDir)); err != nil {
-		return fmt.Errorf("failed to create remote OTA directory: %w", err)
+		return PendingPush{}, fmt.Errorf("failed to create remote OTA directory: %w", err)
 	}
 
 	var progress dbc.ProgressFunc
@@ -351,15 +374,10 @@ func (l *Loader) processDBCUpdate(ctx context.Context, timeout time.Duration, lo
 		defer logger.ClearProgress()
 	}
 	if err := l.dbcInterface.TransferFile(opCtx, srcPath, remotePath, progress); err != nil {
-		return fmt.Errorf("failed to transfer update to DBC: %w", err)
+		return PendingPush{}, fmt.Errorf("failed to transfer update to DBC: %w", err)
 	}
 
 	log.Printf("Copied DBC update to %s", remotePath)
-
-	_, err := l.client.LPush("scooter:update:dbc", fmt.Sprintf("update-from-file:%s", remotePath))
-	if err != nil {
-		return fmt.Errorf("failed to notify update service: %w", err)
-	}
 
 	// Tell the dbc.Interface to leave the vehicle-service update lock
 	// held after Disable(). update-service runs the actual mender
@@ -369,9 +387,12 @@ func (l *Loader) processDBCUpdate(ctx context.Context, timeout time.Duration, lo
 	// power before the installation finishes.
 	l.dbcInterface.MarkDBCUpdateQueued()
 
-	log.Printf("Successfully queued DBC update: %s", filename)
+	log.Printf("Successfully staged DBC update: %s", filename)
 	if logger != nil {
-		logger.Logf("updates", "queued DBC update %s -> %s", filename, remotePath)
+		logger.Logf("updates", "staged DBC update %s -> %s", filename, remotePath)
 	}
-	return nil
+	return PendingPush{
+		Channel: "scooter:update:dbc",
+		Value:   fmt.Sprintf("update-from-file:%s", remotePath),
+	}, nil
 }

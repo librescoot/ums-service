@@ -369,10 +369,21 @@ func (s *Service) switchToNormal(prevMode string) error {
 	}
 
 	s.setStep("updates")
-	if err := s.updateLdr.ProcessUpdates(ctx, s.config.MenderTransferTimeout, logger, mountPoint); err != nil {
+	queued, err := s.updateLdr.ProcessUpdates(ctx, s.config.MenderTransferTimeout, logger, mountPoint)
+	if err != nil {
 		logger.Error("updates", "%v", err)
 		log.Printf("Error processing updates: %v", err)
 	} else {
+		// Perform deferred LPushes synchronously here so existing
+		// behavior is preserved while Task 4 is unimplemented. Task 4
+		// will move these pushes inside the awaiter goroutine after
+		// subscribing to the ota hash.
+		for _, p := range queued.PendingPushes {
+			if _, perr := s.client.LPush(p.Channel, p.Value); perr != nil {
+				logger.Error("updates", "LPush %s failed: %v", p.Channel, perr)
+				log.Printf("LPush %s failed: %v", p.Channel, perr)
+			}
+		}
 		logger.Logf("updates", "done")
 	}
 	logger.ClearProgress()
