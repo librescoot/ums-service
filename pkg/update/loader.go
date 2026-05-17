@@ -39,6 +39,10 @@ type managedDir struct {
 // responsible for subscribing to the ota hash BEFORE performing
 // PendingPushes, so the awaiter doesn't miss the install→pending-reboot
 // transition.
+//
+// MDB and DBC indicate whether the respective artifact was staged
+// (file copied or transferred to its target); they do not reflect
+// whether the LPush in PendingPushes completed.
 type Queued struct {
 	MDB           bool
 	DBC           bool
