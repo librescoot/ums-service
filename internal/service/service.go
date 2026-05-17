@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	ipc "github.com/librescoot/redis-ipc"
 	"github.com/librescoot/ums-service/pkg/config"
@@ -32,6 +33,14 @@ import (
 )
 
 const logBundleKeepCount = 10
+
+const installAwaitTimeout = 10 * time.Minute
+
+var rebootAllowedVehicleStates = map[string]bool{
+	"stand-by":      true,
+	"parked":        true,
+	"shutting-down": true,
+}
 
 type Service struct {
 	config        *config.Config
@@ -55,6 +64,9 @@ type Service struct {
 	mu            sync.Mutex
 	detachCount   int
 	umsModeType   string
+	serviceCtx    context.Context    // set in Run; parent for reboot goroutine
+	rebootWatcher context.CancelFunc // cancel pending reboot goroutine; nil if none
+	rebootGen     int                // increments per startRebootWatcher; lets a stale goroutine know it's been superseded
 }
 
 func New(cfg *config.Config) (*Service, error) {
@@ -131,6 +143,7 @@ func parseRedisAddr(addr string) (string, int, error) {
 
 func (s *Service) Run(ctx context.Context) error {
 	log.Println("Starting UMS service...")
+	s.serviceCtx = ctx
 
 	if err := s.diskMgr.Initialize(); err != nil {
 		return fmt.Errorf("failed to initialize disk manager: %w", err)
@@ -197,6 +210,14 @@ func (s *Service) handleModeChange(mode string) error {
 
 func (s *Service) switchToUMS(mode string) error {
 	s.setStatus("preparing")
+
+	if s.rebootWatcher != nil {
+		log.Println("Cancelling pending reboot watcher (re-entering UMS)")
+		s.rebootWatcher()
+		// Don't nil rebootWatcher here — the goroutine's defer
+		// handles cleanup under the generation check. Nilling
+		// here would also be safe but is redundant.
+	}
 
 	if _, err := s.client.Del("usb:log"); err != nil {
 		log.Printf("Warning: failed to clear usb:log: %v", err)
@@ -374,16 +395,6 @@ func (s *Service) switchToNormal(prevMode string) error {
 		logger.Error("updates", "%v", err)
 		log.Printf("Error processing updates: %v", err)
 	} else {
-		// Perform deferred LPushes synchronously here so existing
-		// behavior is preserved while Task 4 is unimplemented. Task 4
-		// will move these pushes inside the awaiter goroutine after
-		// subscribing to the ota hash.
-		for _, p := range queued.PendingPushes {
-			if _, perr := s.client.LPush(p.Channel, p.Value); perr != nil {
-				logger.Error("updates", "LPush %s failed: %v", p.Channel, perr)
-				log.Printf("LPush %s failed: %v", p.Channel, perr)
-			}
-		}
 		logger.Logf("updates", "done")
 	}
 	logger.ClearProgress()
@@ -443,10 +454,107 @@ func (s *Service) switchToNormal(prevMode string) error {
 
 	s.umsModeType = ""
 	s.setStep("")
-	s.setStatus("idle")
+
+	if queued.MDB || queued.DBC {
+		// Hand off to the awaiter goroutine. It owns setStatus
+		// transitions from "awaiting-reboot" back to "idle".
+		s.startRebootWatcher(queued)
+	} else {
+		s.setStatus("idle")
+	}
 	log.Println("Switched to normal mode and processed files")
 
 	return nil
+}
+
+// startRebootWatcher launches a goroutine that subscribes to the ota
+// hash, performs the queued install LPushes, waits for completion, and
+// triggers a reboot. Must be called with s.mu held (so writes to
+// s.rebootWatcher / s.rebootGen are race-free with switchToUMS).
+func (s *Service) startRebootWatcher(queued update.Queued) {
+	ctx, cancel := context.WithCancel(s.serviceCtx)
+	s.rebootWatcher = cancel
+	s.rebootGen++
+	myGen := s.rebootGen
+	s.setStatus("awaiting-reboot")
+	go s.awaitInstallsAndReboot(ctx, queued, myGen)
+}
+
+func (s *Service) awaitInstallsAndReboot(ctx context.Context, queued update.Queued, myGen int) {
+	defer func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		// If a newer goroutine has been started, leave its state
+		// alone — we're a zombie from a cancelled cycle.
+		if s.rebootGen != myGen {
+			return
+		}
+		s.rebootWatcher = nil
+		// If we were cancelled externally, whoever cancelled us
+		// (switchToUMS) already owns the status field; don't clobber.
+		if ctx.Err() == nil {
+			s.setStatus("idle")
+		}
+	}()
+
+	logger := umslog.New(s.client)
+
+	source, err := update.NewIPCOTASource(s.client)
+	if err != nil {
+		logger.Error("reboot", "subscribe to ota hash: %v", err)
+		log.Printf("awaiter: subscribe failed: %v", err)
+		return
+	}
+	defer source.Stop()
+
+	for _, p := range queued.PendingPushes {
+		if _, perr := s.client.LPush(p.Channel, p.Value); perr != nil {
+			logger.Error("reboot", "LPush %s failed: %v", p.Channel, perr)
+			log.Printf("awaiter: LPush %s failed: %v", p.Channel, perr)
+			return
+		}
+		logger.Logf("reboot", "queued %s", p.Channel)
+	}
+
+	if err := update.WaitForCompletion(ctx, source, queued, installAwaitTimeout); err != nil {
+		logger.Error("reboot", "skip: %v", err)
+		log.Printf("awaiter: skip reboot: %v", err)
+		return
+	}
+
+	state, err := s.client.HGet("vehicle", "state")
+	if err != nil {
+		logger.Error("reboot", "skip: failed to read vehicle state: %v", err)
+		log.Printf("awaiter: failed to read vehicle state: %v", err)
+		return
+	}
+	if !rebootAllowedVehicleStates[state] {
+		logger.Logf("reboot", "skip: vehicle state %q not in allowed set", state)
+		log.Printf("awaiter: skip reboot, vehicle state is %q", state)
+		return
+	}
+
+	if queued.MDB {
+		if _, err := s.client.LPush("scooter:power", "reboot"); err != nil {
+			logger.Error("reboot", "LPush scooter:power reboot failed: %v", err)
+			log.Printf("awaiter: failed to trigger MDB reboot: %v", err)
+			return
+		}
+		logger.Logf("reboot", "MDB reboot triggered")
+		log.Println("awaiter: MDB reboot triggered")
+		return
+	}
+
+	// DBC-only: power-cycle the dashboard.
+	for _, cmd := range []string{"dashboard:off", "dashboard:on"} {
+		if _, err := s.client.LPush("scooter:hardware", cmd); err != nil {
+			logger.Error("reboot", "LPush scooter:hardware %s failed: %v", cmd, err)
+			log.Printf("awaiter: failed to send %s: %v", cmd, err)
+			return
+		}
+	}
+	logger.Logf("reboot", "DBC power cycle triggered")
+	log.Println("awaiter: DBC power cycle triggered")
 }
 
 func (s *Service) checkIfDBCNeeded(mountPoint string) bool {
