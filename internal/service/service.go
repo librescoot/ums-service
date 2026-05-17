@@ -455,9 +455,12 @@ func (s *Service) switchToNormal(prevMode string) error {
 	s.umsModeType = ""
 	s.setStep("")
 
-	if queued.MDB || queued.DBC {
+	if err == nil && (queued.MDB || queued.DBC) {
 		// Hand off to the awaiter goroutine. It owns setStatus
 		// transitions from "awaiting-reboot" back to "idle".
+		// On ProcessUpdates error we skip the watcher even if some
+		// pushes were staged — the partial state would confuse a
+		// user who only sees the error in usb:log.
 		s.startRebootWatcher(queued)
 	} else {
 		s.setStatus("idle")
