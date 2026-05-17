@@ -62,7 +62,10 @@ func WaitForCompletion(ctx context.Context, source OTAStatusSource, q Queued, ti
 	for _, c := range required {
 		st := &awaiterState{}
 		initial, err := source.Current(c)
-		if err == nil && initial != "" && initial != statusPendingReboot {
+		if err != nil {
+			return fmt.Errorf("read initial status for %s: %w", c, err)
+		}
+		if initial != "" && initial != statusPendingReboot {
 			st.sawNonPendingReboot = true
 		}
 		states[c] = st

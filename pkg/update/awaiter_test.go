@@ -248,3 +248,24 @@ func TestWaitForCompletion_NothingQueued(t *testing.T) {
 		t.Errorf("expected nil error for empty Queued, got %v", err)
 	}
 }
+
+func TestWaitForCompletion_SourceClosed(t *testing.T) {
+	src := newFakeOTASource(map[string]string{"mdb": "idle"})
+	q := Queued{MDB: true}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- WaitForCompletion(context.Background(), src, q, 5*time.Second)
+	}()
+
+	src.close()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected error on source close, got nil")
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("timed out")
+	}
+}
