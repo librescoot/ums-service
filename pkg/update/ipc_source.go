@@ -1,10 +1,12 @@
 package update
 
 import (
+	"errors"
 	"fmt"
-	"strings"
+	"log"
 
 	ipc "github.com/librescoot/redis-ipc"
+	"github.com/redis/go-redis/v9"
 )
 
 // ipcOTASource adapts an ipc.HashWatcher on the "ota" hash to the
@@ -36,8 +38,11 @@ func NewIPCOTASource(client *ipc.Client) (*ipcOTASource, error) {
 			select {
 			case s.updates <- StatusUpdate{Component: comp, Status: value}:
 			default:
-				// Channel full — drop. The awaiter polls Current
-				// on next iteration if it needs the latest.
+				// Channel full; drop. The status sequence per
+				// install is short (a handful of events) and
+				// the buffer is sized generously. If this fires
+				// something is stuck upstream and the awaiter's
+				// timeout will catch it.
 			}
 			return nil
 		})
@@ -52,9 +57,7 @@ func NewIPCOTASource(client *ipc.Client) (*ipcOTASource, error) {
 func (s *ipcOTASource) Current(component string) (string, error) {
 	val, err := s.client.HGet("ota", "status:"+component)
 	if err != nil {
-		// redis-ipc reports field-not-found as an error; treat that
-		// as "" so the awaiter sees an idle/blank starting state.
-		if strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "nil") {
+		if errors.Is(err, redis.Nil) {
 			return "", nil
 		}
 		return "", err
@@ -67,5 +70,7 @@ func (s *ipcOTASource) Changes() <-chan StatusUpdate {
 }
 
 func (s *ipcOTASource) Stop() {
-	s.watcher.Stop()
+	if err := s.watcher.Stop(); err != nil {
+		log.Printf("ota source: stop watcher: %v", err)
+	}
 }
