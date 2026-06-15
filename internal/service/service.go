@@ -164,6 +164,20 @@ func (s *Service) Run(ctx context.Context) error {
 		s.usbCtrl.StopMonitoring()
 	}()
 
+	// Seed the usb hash with the baseline state so readers (e.g. `lsc usb
+	// status`) see a real value instead of an empty hash on a boot where no
+	// mode change has happened yet. Writing mode=normal also reconciles any
+	// stale mode=ums left in Redis if the scooter rebooted mid-session, since
+	// the controller always starts in normal mode. NoPublish keeps boot from
+	// emitting a spurious change notification; the watcher's StartWithSync
+	// below reads the hash directly regardless.
+	if err := s.publisher.SetMany(map[string]any{
+		"mode":   s.usbCtrl.GetCurrentMode(),
+		"status": "idle",
+	}, ipc.Sync(), ipc.NoPublish()); err != nil {
+		return fmt.Errorf("failed to seed usb hash: %w", err)
+	}
+
 	// StartWithSync is non-blocking: it subscribes to the Redis channel,
 	// syncs current hash state, then processes messages in a goroutine.
 	if err := s.watcher.StartWithSync(); err != nil {
