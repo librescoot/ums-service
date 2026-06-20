@@ -437,7 +437,7 @@ func (s *Service) switchToNormal(prevMode string) error {
 	logger.ClearProgress()
 
 	if settingsChanged || wgChanged {
-		restartUnit(logger, "settings-service")
+		restartUnit(logger, "librescoot-settings.service")
 	}
 	if radioGagaChanged {
 		restartUnit(logger, "radio-gaga.service")
