@@ -6,8 +6,16 @@ import (
 	ipc "github.com/librescoot/redis-ipc"
 )
 
+// vehicle-service publishes namespaced gestures on "input-events", e.g.
+// brake:right:press or seatbox:tap. Only a 3s left brake hold exits UMS.
+const umsExitEvent = "brake:left:hold"
+
 func (s *Service) startBrakeExitListener() error {
 	_, err := ipc.Subscribe(s.client, "input-events", func(event string) error {
+		if event != umsExitEvent {
+			return nil
+		}
+
 		s.mu.Lock()
 		currentMode := s.usbCtrl.GetCurrentMode()
 		s.mu.Unlock()
