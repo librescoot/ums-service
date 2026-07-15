@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	ipc "github.com/librescoot/redis-ipc"
@@ -64,6 +65,11 @@ type Service struct {
 	mu            sync.Mutex
 	detachCount   int
 	umsModeType   string
+	// cancelPending is set by the brake exit listener without taking mu,
+	// which switchToUMS holds for the whole preparing phase. It lets a
+	// left brake hold during preparing abandon the entry before the USB
+	// gadget is ever switched. Cleared at the start of every entry.
+	cancelPending atomic.Bool
 	serviceCtx    context.Context    // set in Run; parent for reboot goroutine
 	rebootWatcher context.CancelFunc // cancel pending reboot goroutine; nil if none
 	rebootGen     int                // increments per startRebootWatcher; lets a stale goroutine know it's been superseded
@@ -223,6 +229,8 @@ func (s *Service) handleModeChange(mode string) error {
 }
 
 func (s *Service) switchToUMS(mode string) error {
+	// Only a hold that lands from here on counts as cancelling this entry.
+	s.cancelPending.Store(false)
 	s.setStatus("preparing")
 
 	if s.rebootWatcher != nil {
@@ -301,6 +309,23 @@ func (s *Service) switchToUMS(mode string) error {
 	if err := s.diskMgr.Unmount(); err != nil {
 		s.setStatus("idle")
 		return fmt.Errorf("failed to unmount drive: %w", err)
+	}
+
+	// A left brake hold during preparing abandons the entry here, with the
+	// drive already unmounted and the gadget untouched. Bailing out before
+	// SwitchMode avoids loading g_mass_storage only to unload it again on
+	// the exit path, which would drop the DBC's g_ether link for no reason.
+	if s.cancelPending.Load() {
+		log.Println("UMS entry cancelled by left brake hold during preparing")
+		s.setStep("")
+		s.setStatus("idle")
+		// The gadget never moved, but usb.mode still reads ums from the
+		// request that got us here. Reconcile it the way doSwitchToNormal
+		// does, so the hash keeps matching the controller.
+		if err := s.publisher.Set("mode", "normal", ipc.Sync()); err != nil {
+			log.Printf("Error updating Redis usb mode: %v", err)
+		}
+		return nil
 	}
 
 	// Publish status BEFORE switching USB — DBC can still read Redis via g_ether

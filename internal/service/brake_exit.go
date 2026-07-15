@@ -16,10 +16,17 @@ func (s *Service) startBrakeExitListener() error {
 			return nil
 		}
 
+		// Flag first: switchToUMS holds mu for the whole preparing phase,
+		// so the Lock below parks us until entry has finished. Recording
+		// the hold beforehand lets switchToUMS see it and abandon entry.
+		s.cancelPending.Store(true)
+
 		s.mu.Lock()
 		currentMode := s.usbCtrl.GetCurrentMode()
 		s.mu.Unlock()
 
+		// Entry we just cancelled never reached UMS, so there is nothing
+		// to switch back; switchToUMS already returned things to idle.
 		if currentMode != "ums" {
 			return nil
 		}
