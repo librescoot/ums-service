@@ -110,6 +110,17 @@ On boot and again after every UMS cycle, ums-service performs housekeeping:
 
 Post-cycle cleanup skips pruning of `/data/ota/{mdb,dbc}` because update-service installs queued .mender files asynchronously after our LPush; the next boot's full cleanup sweeps them.
 
+## Diagnostics
+
+Each UMS cycle captures `journal.log`, `dmesg.log` and `system-info.txt` for the
+MDB, plus the same three for the DBC when it answers on 192.168.7.2.
+
+The MDB `system-info.txt` ends with a `=== modem ===` section read from the
+`internet` and `modem` Redis hashes: IMEI, ICCID and IMSI first, then operator,
+access tech, signal, registration, connectivity, IP and the modem health /
+SIM / PIN / APN state. Fields Redis has no value for print as `-`. This is
+where to look for the identifiers connectivity onboarding asks for.
+
 ## File Processing
 
 ### When switching to UMS mode:

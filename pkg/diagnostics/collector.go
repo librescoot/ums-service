@@ -19,10 +19,19 @@ const (
 	dbcCommandTimeout = 30 * time.Second
 )
 
-type Collector struct{}
+// HashReader reads a whole Redis hash. Satisfied by *ipc.Client.
+type HashReader interface {
+	HGetAll(key string) (map[string]string, error)
+}
 
-func New() *Collector {
-	return &Collector{}
+type Collector struct {
+	hashes HashReader
+}
+
+// New builds a collector. hashes may be nil, in which case the Redis-derived
+// sections of the system info dump are skipped.
+func New(hashes HashReader) *Collector {
+	return &Collector{hashes: hashes}
 }
 
 func (c *Collector) CollectToUSB(mountPoint string) {
@@ -137,9 +146,71 @@ func (c *Collector) writeMDBSystemInfo(dir string) {
 		content += fmt.Sprintf("=== %s ===\n%s\n", s.header, out)
 	}
 
+	content += c.modemSection()
+
 	if err := os.WriteFile(filepath.Join(dir, "system-info.txt"), []byte(content), 0644); err != nil {
 		log.Printf("Failed to write system-info.txt: %v", err)
 	}
+}
+
+// modemRows lists what the modem section prints, in order, as
+// {label, hash, field}. Identity first: IMEI and ICCID are what the
+// connectivity onboarding flow asks people for, IMSI identifies the
+// subscription. The rest is network and health context for support.
+var modemRows = [][3]string{
+	{"IMEI", "internet", "sim-imei"},
+	{"ICCID", "internet", "sim-iccid"},
+	{"IMSI", "internet", "sim-imsi"},
+	{"operator", "modem", "operator-name"},
+	{"operator code", "modem", "operator-code"},
+	{"access tech", "internet", "access-tech"},
+	{"signal quality", "internet", "signal-quality"},
+	{"registration", "modem", "registration"},
+	{"roaming", "modem", "is-roaming"},
+	{"connectivity", "internet", "connectivity"},
+	{"modem state", "internet", "modem-state"},
+	{"internet status", "internet", "status"},
+	{"ip address", "internet", "ip-address"},
+	{"modem health", "internet", "modem-health"},
+	{"power state", "modem", "power-state"},
+	{"sim state", "modem", "sim-state"},
+	{"sim lock", "modem", "sim-lock"},
+	{"pin action", "modem", "pin-action"},
+	{"apn action", "modem", "apn-action"},
+	{"registration fail", "modem", "registration-fail"},
+	{"error state", "modem", "error-state"},
+}
+
+func (c *Collector) modemSection() string {
+	if c.hashes == nil {
+		return "=== modem ===\nERROR: no Redis connection\n\n"
+	}
+
+	values := map[string]map[string]string{}
+	for _, name := range []string{"internet", "modem"} {
+		h, err := c.hashes.HGetAll(name)
+		if err != nil {
+			return fmt.Sprintf("=== modem ===\nERROR: reading %s hash: %v\n\n", name, err)
+		}
+		values[name] = h
+	}
+
+	width := 0
+	for _, r := range modemRows {
+		if n := len(r[0]) + 1; n > width { // +1 for the trailing colon
+			width = n
+		}
+	}
+
+	content := "=== modem ===\n"
+	for _, r := range modemRows {
+		v := values[r[1]][r[2]]
+		if v == "" {
+			v = "-"
+		}
+		content += fmt.Sprintf("%-*s  %s\n", width, r[0]+":", v)
+	}
+	return content + "\n"
 }
 
 func writeCommandOutput(dir, filename string, name string, args ...string) {

@@ -114,7 +114,7 @@ func New(cfg *config.Config) (*Service, error) {
 		updateLdr:     updateLdr,
 		mapsUpdater:   mapsUpdater,
 		wgManager:     wgManager,
-		diagnostics:   diagnostics.New(),
+		diagnostics:   diagnostics.New(client),
 		rpmInstaller:  rpmInstaller,
 		scriptRunner:  scriptRunner,
 		logBundlesMgr: logbundles.New(),
