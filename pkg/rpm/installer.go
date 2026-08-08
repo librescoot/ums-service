@@ -129,12 +129,12 @@ func (i *Installer) processDBCRPMs(ctx context.Context, timeout time.Duration, l
 	installCmd := fmt.Sprintf("rpm -Uvh --force %s", strings.Join(remoteFiles, " "))
 	output, err := i.dbcInterface.RunCommand(opCtx, installCmd)
 	if err != nil {
-		// Clean up even on failure — use a fresh short context in case
-		// the outer one is already done. The install error above is the
-		// one that matters to the caller, so a failed cleanup here is
-		// discarded rather than compounding it.
+		// Clean up even on failure, with a fresh short context in case the
+		// outer one is already done.
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
-		_, _ = i.dbcInterface.RunCommand(cleanupCtx, fmt.Sprintf("rm -rf %s", dbcRPMDir))
+		if _, cleanupErr := i.dbcInterface.RunCommand(cleanupCtx, fmt.Sprintf("rm -rf %s", dbcRPMDir)); cleanupErr != nil {
+			log.Printf("Failed to clean up remote RPMs after install failure: %v", cleanupErr)
+		}
 		cleanupCancel()
 		return fmt.Errorf("DBC rpm install failed: %v", err)
 	}
