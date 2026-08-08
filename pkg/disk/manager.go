@@ -37,7 +37,9 @@ func (m *Manager) cleanupTempFile() {
 	tmpFile := m.driveFile + tmpSuffix
 	if _, err := os.Stat(tmpFile); err == nil {
 		log.Printf("Removing leftover temp drive file %s", tmpFile)
-		os.Remove(tmpFile)
+		if err := os.Remove(tmpFile); err != nil {
+			log.Printf("Failed to remove leftover temp drive file %s: %v", tmpFile, err)
+		}
 	}
 }
 
@@ -57,17 +59,17 @@ func (m *Manager) createAndFormatDrive() error {
 	}
 
 	if err := m.createDriveFile(tmpFile); err != nil {
-		os.Remove(tmpFile)
+		_ = os.Remove(tmpFile)
 		return fmt.Errorf("failed to create drive file: %w", err)
 	}
 
 	if err := m.formatDrive(tmpFile); err != nil {
-		os.Remove(tmpFile)
+		_ = os.Remove(tmpFile)
 		return fmt.Errorf("failed to format drive: %w", err)
 	}
 
 	if err := os.Rename(tmpFile, m.driveFile); err != nil {
-		os.Remove(tmpFile)
+		_ = os.Remove(tmpFile)
 		return fmt.Errorf("failed to move drive file into place: %w", err)
 	}
 
@@ -106,7 +108,9 @@ func (m *Manager) checkFilesystem() error {
 func (m *Manager) Mount() error {
 	if err := m.checkFilesystem(); err != nil {
 		log.Printf("Filesystem check failed: %v — recreating drive", err)
-		os.Remove(m.driveFile)
+		if err := os.Remove(m.driveFile); err != nil {
+			log.Printf("Failed to remove corrupted drive file %s: %v", m.driveFile, err)
+		}
 		if err := m.createAndFormatDrive(); err != nil {
 			return fmt.Errorf("failed to recreate drive after corruption: %w", err)
 		}
@@ -129,7 +133,9 @@ func (m *Manager) Unmount() error {
 		return fmt.Errorf("failed to unmount drive: %w", err)
 	}
 
-	os.RemoveAll(m.mountPoint)
+	if err := os.RemoveAll(m.mountPoint); err != nil {
+		log.Printf("Failed to remove mount point %s: %v", m.mountPoint, err)
+	}
 	log.Println("Unmounted USB drive")
 	return nil
 }
