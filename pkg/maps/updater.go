@@ -27,7 +27,15 @@ func isCompressedTilesArchive(filename string) bool {
 	return strings.HasSuffix(filename, ".tar.zst")
 }
 
-func isValhallaTilesArchive(filename string) bool {
+// IsValhallaTilesArchive reports whether a file on the USB drive is a routing
+// tile archive this service knows how to install, in either the plain or the
+// zstd-compressed form.
+//
+// Exported because the service also has to answer "does this stick need the
+// DBC powered up?" before it gets anywhere near ProcessMaps. That check used to
+// carry its own copy of the predicate, drifted, and stopped matching .tar.zst,
+// which left the DBC off and made the whole update a silent no-op.
+func IsValhallaTilesArchive(filename string) bool {
 	base := strings.TrimSuffix(filename, ".zst")
 	return strings.HasSuffix(base, "tiles.tar") ||
 		(strings.HasPrefix(base, "valhalla_tiles_") && strings.HasSuffix(base, ".tar"))
@@ -82,7 +90,7 @@ func (u *Updater) ProcessMaps(ctx context.Context, perFileTimeout time.Duration,
 		filename := entry.Name()
 		if strings.HasSuffix(filename, ".mbtiles") {
 			mbtilesFile = filepath.Join(mapsDir, filename)
-		} else if isValhallaTilesArchive(filename) {
+		} else if IsValhallaTilesArchive(filename) {
 			tilesFile = filepath.Join(mapsDir, filename)
 		}
 	}
@@ -129,6 +137,30 @@ func (u *Updater) processMBTiles(ctx context.Context, timeout time.Duration, log
 	return nil
 }
 
+// cleanupRemoteTimeout bounds the best-effort tidy-up after a failed map
+// transfer. The paths being removed are leftovers, so giving up on them is
+// cheap; blocking the whole UMS cycle on a DBC that has stopped answering is
+// not. RunCommand shells out to ssh without a ConnectTimeout of its own, so
+// without a deadline here the cleanup can hang indefinitely.
+const cleanupRemoteTimeout = 30 * time.Second
+
+// cleanupRemote removes leftover files from the DBC on a failure path. It
+// deliberately detaches from opCtx's cancellation, because the usual reason to
+// be here is that opCtx just expired, but keeps a short deadline of its own.
+func (u *Updater) cleanupRemote(opCtx context.Context, paths ...string) {
+	if len(paths) == 0 {
+		return
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(opCtx), cleanupRemoteTimeout)
+	defer cancel()
+
+	cmd := "rm -f " + strings.Join(paths, " ")
+	if _, err := u.dbcInterface.RunCommand(cleanupCtx, cmd); err != nil {
+		log.Printf("Could not remove %s from DBC after a failed map transfer: %v",
+			strings.Join(paths, ", "), err)
+	}
+}
+
 func (u *Updater) processTilesTar(ctx context.Context, timeout time.Duration, logger *umslog.Logger, localPath string) error {
 	opCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -150,6 +182,10 @@ func (u *Updater) processTilesTar(ctx context.Context, timeout time.Duration, lo
 		defer logger.ClearProgress()
 	}
 	if err := u.dbcInterface.TransferFile(opCtx, localPath, uploadPath, progress); err != nil {
+		// Whatever made it across is still sitting on the DBC, up to several
+		// hundred MB of /data holding a file nothing will ever read. Clear it
+		// the same way the decompress failure below does.
+		u.cleanupRemote(opCtx, uploadPath)
 		return fmt.Errorf("failed to transfer tiles archive to DBC: %w", err)
 	}
 
@@ -168,10 +204,7 @@ func (u *Updater) processTilesTar(ctx context.Context, timeout time.Duration, lo
 			// Best effort: whichever stage failed, remotePath was never
 			// touched, so just clear the temp decompress target and the
 			// upload rather than leaving them occupying /data.
-			cleanupCmd := fmt.Sprintf("rm -f %s %s", tmpPath, uploadPath)
-			if _, rmErr := u.dbcInterface.RunCommand(context.WithoutCancel(opCtx), cleanupCmd); rmErr != nil {
-				log.Printf("Could not remove %s and %s from DBC after failed decompress: %v", tmpPath, uploadPath, rmErr)
-			}
+			u.cleanupRemote(opCtx, tmpPath, uploadPath)
 			return fmt.Errorf("failed to decompress tiles archive on DBC: %w", err)
 		}
 		if _, err := u.dbcInterface.RunCommand(opCtx, "rm -f "+uploadPath); err != nil {

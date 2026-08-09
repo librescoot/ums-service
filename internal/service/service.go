@@ -615,9 +615,7 @@ func (s *Service) checkIfDBCNeeded(mountPoint string) bool {
 		for _, entry := range entries {
 			if !entry.IsDir() {
 				filename := entry.Name()
-				if strings.HasSuffix(filename, ".mbtiles") ||
-					strings.HasSuffix(filename, "tiles.tar") ||
-					(strings.HasPrefix(filename, "valhalla_tiles_") && strings.HasSuffix(filename, ".tar")) {
+				if strings.HasSuffix(filename, ".mbtiles") || maps.IsValhallaTilesArchive(filename) {
 					log.Println("Found map files, DBC needed")
 					return true
 				}

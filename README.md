@@ -12,7 +12,7 @@ Part of the [Librescoot](https://librescoot.org/) open-source platform.
 - **Settings Management**: Sync settings.toml between device and USB drive
 - **WireGuard VPN**: Manage WireGuard configuration files (create, update, delete)
 - **System Updates**: Process .mender update files for both main board (MDB) and dashboard computer (DBC)
-- **Map Updates**: Transfer map files (.mbtiles and tiles.tar) to the dashboard computer
+- **Map Updates**: Transfer map files (.mbtiles and tiles.tar, plain or zstd-compressed) to the dashboard computer
 - **Dashboard Computer Interface**: Manage DBC connectivity and file transfers via SSH/HTTP
 
 ## Architecture
@@ -90,7 +90,7 @@ When in UMS mode, the virtual drive contains:
 │   └── librescoot-dbc-*.mender
 ├── maps/                # Place map files here (write-in only)
 │   ├── *.mbtiles
-│   └── *tiles.tar or valhalla_tiles_*.tar
+│   └── *tiles.tar or valhalla_tiles_*.tar, either plain or .zst
 ├── log-bundles/         # Saved diagnostic bundles from `lsc logs` (read-only)
 │   └── logs-*.tar.gz
 └── diagnostics/         # Live system info captured each cycle (read-only)
@@ -145,7 +145,7 @@ where to look for the identifiers connectivity onboarding asks for.
 6. **Updates**:
    - MDB updates: Installs locally and marks for reboot
    - DBC updates: Transfers to DBC and installs remotely
-7. **Maps**: Transfers map files to DBC
+7. **Maps**: Transfers map files to DBC. A routing archive dropped on the stick as `.tar.zst` is uploaded compressed and decompressed on the DBC, into a temp file that only replaces `/data/valhalla/tiles.tar` once the whole stream has decoded. Valhalla mmaps that file, so what gets installed is always the plain seekable tar.
 8. Runs post-cycle cleanup (see above)
 9. Cleans the USB drive
 10. Reboots if required by updates

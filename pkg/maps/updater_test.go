@@ -18,8 +18,8 @@ func TestIsValhallaTilesArchive(t *testing.T) {
 		{"tiles.tar.zst.part", false},
 	}
 	for _, c := range cases {
-		if got := isValhallaTilesArchive(c.name); got != c.want {
-			t.Errorf("isValhallaTilesArchive(%q) = %v, want %v", c.name, got, c.want)
+		if got := IsValhallaTilesArchive(c.name); got != c.want {
+			t.Errorf("IsValhallaTilesArchive(%q) = %v, want %v", c.name, got, c.want)
 		}
 	}
 }
