@@ -176,6 +176,13 @@ func (u *Updater) processTilesTar(ctx context.Context, timeout time.Duration, lo
 		uploadPath = remotePath + ".zst"
 	}
 
+	// Before the upload, not after: the transfer is the slow part, and finding
+	// out that /data was never going to hold the result is worth nothing once
+	// the user has already waited it out.
+	if err := u.checkDBCSpace(opCtx, localPath, compressed); err != nil {
+		return err
+	}
+
 	var progress dbc.ProgressFunc
 	if logger != nil {
 		progress = logger.ProgressCallback(filepath.Base(uploadPath))
