@@ -77,12 +77,25 @@ func (m *Manager) createAndFormatDrive() error {
 	return nil
 }
 
+// createDriveFile allocates the backing store sparsely.
+//
+// This runs before the service answers anything, so its cost is time the
+// vehicle spends unresponsive on first boot after an install. Writing a
+// gigabyte of zeros took most of a minute on eMMC and wore the flash for a
+// file whose contents are then immediately replaced by mkfs; truncate takes
+// no measurable time and allocates blocks as they are written.
+//
+// The gadget's file-backed storage handles a sparse image, and /data has room
+// for the drive to fill out. A write that outruns free space fails at the
+// point of writing rather than here.
 func (m *Manager) createDriveFile(path string) error {
-	cmd := exec.Command("dd", "if=/dev/zero", fmt.Sprintf("of=%s", path),
-		"bs=1M", fmt.Sprintf("count=%d", m.driveSize/(1024*1024)))
-	output, err := cmd.CombinedOutput()
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
-		return fmt.Errorf("dd failed: %v, output: %s", err, string(output))
+		return fmt.Errorf("create %s: %w", path, err)
+	}
+	defer f.Close()
+	if err := f.Truncate(m.driveSize); err != nil {
+		return fmt.Errorf("size %s to %d bytes: %w", path, m.driveSize, err)
 	}
 	return nil
 }
