@@ -95,7 +95,7 @@ func New(cfg *config.Config) (*Service, error) {
 
 	dbcInterface := dbc.New("/data/dbc", client)
 	settingsLdr := settings.New()
-	mapsUpdater := maps.New(dbcInterface)
+	mapsUpdater := maps.New(dbcInterface, client)
 	wgManager := wireguard.New()
 
 	updateLdr := update.New(client, dbcInterface)

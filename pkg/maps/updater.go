@@ -9,6 +9,8 @@ import (
 	"strings"
 	"time"
 
+	ipc "github.com/librescoot/redis-ipc"
+
 	"github.com/librescoot/ums-service/pkg/dbc"
 	"github.com/librescoot/ums-service/pkg/umslog"
 )
@@ -17,6 +19,9 @@ type Updater struct {
 	dbcMapsDir     string
 	dbcValhallaDir string
 	dbcInterface   *dbc.Interface
+	// Used to mirror what was installed into the `maps` hash. May be nil, in
+	// which case only the DBC's metadata.json is updated.
+	client *ipc.Client
 }
 
 // isCompressedTilesArchive reports whether the file is the zstd-compressed
@@ -41,11 +46,12 @@ func IsValhallaTilesArchive(filename string) bool {
 		(strings.HasPrefix(base, "valhalla_tiles_") && strings.HasSuffix(base, ".tar"))
 }
 
-func New(dbcInterface *dbc.Interface) *Updater {
+func New(dbcInterface *dbc.Interface, client *ipc.Client) *Updater {
 	return &Updater{
 		dbcMapsDir:     "/data/maps",
 		dbcValhallaDir: "/data/valhalla",
 		dbcInterface:   dbcInterface,
+		client:         client,
 	}
 }
 
@@ -134,6 +140,11 @@ func (u *Updater) processMBTiles(ctx context.Context, timeout time.Duration, log
 	}
 
 	log.Printf("Successfully copied mbtiles to DBC at %s", remotePath)
+
+	// Bookkeeping runs on the parent context, not opCtx: the transfer may have
+	// used most of the per-file budget, and recording what landed is worth a
+	// few more seconds even when it did.
+	u.recordInstall(ctx, true, filepath.Base(localPath), remotePath)
 	return nil
 }
 
@@ -220,5 +231,7 @@ func (u *Updater) processTilesTar(ctx context.Context, timeout time.Duration, lo
 	}
 
 	log.Printf("Successfully installed tiles archive on DBC at %s", remotePath)
+
+	u.recordInstall(ctx, false, filepath.Base(localPath), remotePath)
 	return nil
 }
