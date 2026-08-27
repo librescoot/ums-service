@@ -3,6 +3,7 @@ package disk
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 )
@@ -37,6 +38,30 @@ func TestCreateDriveFileIsSparse(t *testing.T) {
 	allocated := st.Blocks * 512
 	if allocated > size/100 {
 		t.Errorf("allocated %d bytes on disk for a %d byte file; expected a sparse allocation, not a full write", allocated, size)
+	}
+}
+
+func TestShouldSetLabel(t *testing.T) {
+	for current, want := range map[string]bool{
+		"":           true, // mkfs.fat without -n
+		"   ":        true,
+		"NO NAME":    true,
+		"no name":    true,
+		"LIBRESCOOT": false, // already ours
+		"MY MUSIC":   false, // renamed from the host, leave it
+	} {
+		if got := shouldSetLabel(current); got != want {
+			t.Errorf("shouldSetLabel(%q) = %v, want %v", current, got, want)
+		}
+	}
+}
+
+func TestVolumeLabelFitsFAT(t *testing.T) {
+	if len(volumeLabel) > 11 {
+		t.Errorf("label %q is %d chars; FAT allows 11", volumeLabel, len(volumeLabel))
+	}
+	if volumeLabel != strings.ToUpper(volumeLabel) {
+		t.Errorf("label %q must be uppercase", volumeLabel)
 	}
 }
 

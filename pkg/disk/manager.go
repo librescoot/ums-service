@@ -6,9 +6,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 )
 
 const tmpSuffix = ".tmp"
+
+// volumeLabel is what the host shows the drive as. FAT labels are 11
+// characters, uppercase.
+const volumeLabel = "LIBRESCOOT"
 
 type Manager struct {
 	driveFile  string
@@ -46,6 +51,51 @@ func (m *Manager) cleanupTempFile() {
 func (m *Manager) ensureDriveExists() error {
 	if _, err := os.Stat(m.driveFile); os.IsNotExist(err) {
 		return m.createAndFormatDrive()
+	}
+	m.ensureLabel()
+	return nil
+}
+
+// ensureLabel relabels a drive that predates the label in place. Drives already
+// in the field are never reformatted, so without this they would show up as
+// "NO NAME" forever. Failure is not fatal: an unlabelled drive still works.
+func (m *Manager) ensureLabel() {
+	current, err := m.readLabel()
+	if err != nil {
+		log.Printf("Could not read volume label of %s: %v", m.driveFile, err)
+		return
+	}
+	if !shouldSetLabel(current) {
+		return
+	}
+	if err := m.setLabel(volumeLabel); err != nil {
+		log.Printf("Could not set volume label on %s: %v", m.driveFile, err)
+		return
+	}
+	log.Printf("Set volume label of %s to %s", m.driveFile, volumeLabel)
+}
+
+// shouldSetLabel reports whether an existing label is ours to overwrite. An
+// empty or default label means nobody picked it; anything else was chosen from
+// the host and is left alone.
+func shouldSetLabel(current string) bool {
+	current = strings.TrimSpace(current)
+	return current == "" || strings.EqualFold(current, "NO NAME")
+}
+
+func (m *Manager) readLabel() (string, error) {
+	// Read from stdout only: fatlabel puts warnings on stderr.
+	output, err := exec.Command("fatlabel", m.driveFile).Output()
+	if err != nil {
+		return "", fmt.Errorf("fatlabel failed: %w", err)
+	}
+	return strings.TrimSpace(string(output)), nil
+}
+
+func (m *Manager) setLabel(label string) error {
+	output, err := exec.Command("fatlabel", m.driveFile, label).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("fatlabel failed: %v, output: %s", err, string(output))
 	}
 	return nil
 }
@@ -101,7 +151,7 @@ func (m *Manager) createDriveFile(path string) error {
 }
 
 func (m *Manager) formatDrive(path string) error {
-	cmd := exec.Command("mkfs.fat", "-F", "32", path)
+	cmd := exec.Command("mkfs.fat", "-F", "32", "-n", volumeLabel, path)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("mkfs.fat failed: %v, output: %s", err, string(output))
