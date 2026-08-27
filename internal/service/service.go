@@ -696,8 +696,8 @@ func (s *Service) doSwitchToNormal() {
 
 // LED fade indices (from /usr/share/led-curves/fades/)
 const (
-	fadeSmoothOn  = 0 // fade0-parking-smooth-on
-	fadeSmoothOff = 1 // fade1-smooth-off
+	fadeSmoothOff = 1 // fade1-smooth-off, ends at duty 6
+	fadeDimOn     = 4 // fade4-brake-dim-on, ramps to duty 156
 )
 
 // Blinker LED channels (3,4,6,7) used as UMS indicators.
@@ -708,9 +708,9 @@ type ledPattern struct {
 }
 
 var (
-	ledsUMSActive = ledPattern{channels: []int{3, 4, 6, 7}, fade: fadeSmoothOn}
-	ledsWaitingPC = ledPattern{channels: []int{3, 4}, fade: fadeSmoothOn}
-	ledsOff       = ledPattern{channels: []int{3, 4, 6, 7}, fade: fadeSmoothOff}
+	ledsUMSActive = ledPattern{channels: []int{3, 4, 6, 7}, fade: fadeDimOn}
+	ledsWaitingPC = ledPattern{channels: []int{3, 4}, fade: fadeDimOn}
+	ledsOff       = ledPattern{channels: nil, fade: fadeSmoothOff}
 )
 
 var allBlinkerChannels = []int{3, 4, 6, 7}
