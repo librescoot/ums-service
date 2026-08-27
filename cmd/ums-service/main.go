@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -11,12 +12,26 @@ import (
 	"github.com/librescoot/ums-service/pkg/config"
 )
 
+// Injected at build time from git describe.
+var version = "dev"
+
 func main() {
+	// Scanned rather than parsed with flag: an unrecognised argument used to
+	// start the service anyway, and flag would instead make it fatal.
+	for _, arg := range os.Args[1:] {
+		if arg == "--version" || arg == "-version" {
+			fmt.Println(version)
+			return
+		}
+	}
+
 	if os.Getenv("JOURNAL_STREAM") != "" {
 		log.SetFlags(0)
 	} else {
 		log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
 	}
+
+	log.Printf("ums-service %s", version)
 
 	cfg := config.New()
 

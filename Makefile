@@ -2,7 +2,8 @@
 
 BINARY_NAME=ums-service
 BUILD_DIR=bin
-LDFLAGS=-ldflags "-w -s -extldflags '-static'"
+VERSION=$(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
+LDFLAGS=-ldflags "-w -s -extldflags '-static' -X main.version=$(VERSION)"
 
 build:
 	mkdir -p $(BUILD_DIR)
