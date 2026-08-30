@@ -59,7 +59,6 @@ func (l *Loader) CopyFromUSB(usbMountPath string) (bool, error) {
 		return false, nil
 	}
 
-	// Check if content changed
 	changed := true
 	if existing, err := os.ReadFile(l.settingsFile); err == nil {
 		changed = string(existing) != string(input)

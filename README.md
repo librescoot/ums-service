@@ -1,232 +1,97 @@
 # Librescoot UMS Service
 
-A Go service that manages USB gadget mode switching between network (g_ether) and USB Mass Storage (UMS) modes on embedded Linux devices. The service monitors Redis for mode change commands and handles file transfers between the host computer and the device.
-
 Part of the [Librescoot](https://librescoot.org/) open-source platform.
 
-## Features
+The UMS Service provides the vehicle's USB gadget workflow. It switches the MDB USB connection between Ethernet and USB mass-storage modes, presents a managed FAT drive to a host, then imports supported files and coordinates resulting update/reboot work through Redis or Valkey.
+## Capabilities
 
-- **USB Mode Switching**: Dynamically switch between network mode (g_ether) and USB mass storage mode
-- **Redis Integration**: Monitor Redis for mode change commands via PUBLISH/SUBSCRIBE
-- **Virtual USB Drive**: Automatically creates and manages a 1GB FAT32-formatted virtual drive
-- **Settings Management**: Sync settings.toml between device and USB drive
-- **WireGuard VPN**: Manage WireGuard configuration files (create, update, delete)
-- **System Updates**: Process .mender update files for both main board (MDB) and dashboard computer (DBC)
-- **Map Updates**: Transfer map files (.mbtiles and tiles.tar, plain or zstd-compressed) to the dashboard computer
-- **Dashboard Computer Interface**: Manage DBC connectivity and file transfers via SSH/HTTP
+- Switches between `g_ether` (normal) and `g_mass_storage` (UMS) USB gadget modules.
+- Creates and manages a 1 GiB FAT-backed virtual drive at `/data/usb.drive` by default.
+- Exports and imports settings, WireGuard configuration, selected service configuration, and an optional boot script.
+- Queues MDB and DBC Mender update artifacts, transfers DBC-bound content through the DBC interface, and waits for queued installation status before a permitted reboot.
+- Imports supported map archives, RPMs, and MDB/DBC scripts.
+- Collects diagnostics and exposes saved log bundles on the virtual drive.
+- Tracks USB attach/detach state, supports the two-detach `ums-by-dbc` flow, and updates the `usb` Redis/Valkey hash with mode, status, and processing step.
+- Prunes retained log bundles and stale OTA artifacts at startup and after UMS cycles.
 
-## Architecture
+## Operation and interfaces
 
-```
-ums-service/
-├── cmd/ums-service/      # Main entry point
-├── internal/service/     # Service orchestration
-└── pkg/
-    ├── config/          # Configuration management
-    ├── dbc/            # Dashboard Computer interface
-    ├── disk/           # Virtual disk operations
-    ├── maps/           # Map file updates
-    ├── redis/          # Redis pub/sub handling
-    ├── settings/       # Settings file management
-    ├── update/         # System update handling
-    ├── usb/            # USB gadget mode control
-    └── wireguard/      # WireGuard config management
+The service watches the `mode` field of the `usb` hash. Set the field and publish the `usb` channel using the normal Redis/Valkey hash-notification convention:
+
+```sh
+redis-cli HSET usb mode ums
+redis-cli PUBLISH usb mode
 ```
 
-## Requirements
+Supported modes are:
 
-- Linux with USB gadget support
-- Redis server
-- Root/sudo access for kernel module operations
-- Tools: `modprobe`, `mkfs.fat`, `mount`, `ssh`, `scp`
+| Mode | Behaviour |
+| --- | --- |
+| `normal` | Uses the Ethernet gadget and processes any completed UMS cycle. |
+| `ums` | Presents the virtual mass-storage drive; the first detected USB-host detach returns to normal mode. |
+| `ums-by-dbc` | Presents the same drive but waits for a second detected detach before returning to normal mode. |
+
+At startup the service seeds `usb.mode=normal` and `usb.status=idle`. During a cycle it publishes statuses including `preparing`, `active`, `processing`, `awaiting-reboot`, and `idle`; `usb.step` identifies the current import stage. Per-cycle detail is also written to the virtual drive as `ums_log.txt`.
+
+The exported drive contains managed areas for `settings.toml`, `wireguard/`, `radio-gaga/`, `uplink-service/`, `onboot.sh`, `system-update/`, `maps/`, `rpms/`, `scripts/`, `log-bundles/`, and `diagnostics/`. On return to normal mode, the service copies supported configuration back to its managed locations, processes imports, restarts affected services when configuration changed, cleans the drive, and unmounts it.
+
+Do not remove the virtual drive file or force-unload its gadget module while a host is writing it. Let the host detach and allow the service to complete its processing cycle.
 
 ## Configuration
 
-The service can be configured via environment variables:
+The service has no general command-line configuration; `--version` or `-version` prints the build version. Configure it with environment variables:
 
-- `REDIS_ADDR`: Redis server address (default: `localhost:6379`)
-- `REDIS_PASSWORD`: Redis password (default: empty)
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `REDIS_ADDR` | `localhost:6379` | Redis/Valkey address |
+| `REDIS_PASSWORD` | empty | Read into configuration but not currently passed to the Redis/Valkey IPC client |
+| `UMS_MAP_TIMEOUT` | `10m` | Per-map DBC-transfer timeout |
+| `UMS_RPM_TIMEOUT` | `5m` | Per-RPM DBC-transfer timeout |
+| `UMS_SCRIPT_TIMEOUT` | `2m` | Per-script DBC-transfer timeout |
+| `UMS_MENDER_TIMEOUT` | `15m` | Per-Mender DBC-transfer timeout |
 
-## Redis Commands
+Invalid timeout values are logged and fall back to their defaults. The virtual-drive path and size are currently configured in the program as `/data/usb.drive` and 1 GiB.
 
-The service monitors Redis for mode changes:
+## Build and test
 
-```bash
-# Switch to USB Mass Storage mode (regular)
-redis-cli HSET usb mode ums
-redis-cli PUBLISH usb mode
+A Go toolchain is required. The default target cross-compiles a Linux ARMv7 binary.
 
-# Switch to USB Mass Storage mode (DBC-specific)
-# Stays in UMS mode after first disconnect, switches to normal after second disconnect
-redis-cli HSET usb mode ums-by-dbc
-redis-cli PUBLISH usb mode
-
-# Switch to normal (network) mode
-redis-cli HSET usb mode normal
-redis-cli PUBLISH usb mode
-```
-
-### Mode Behavior
-
-- **ums**: Switches to normal mode after the first USB disconnect
-- **ums-by-dbc**: Stays in UMS mode after the first disconnect, only switches to normal after the second disconnect (useful for DBC updates where multiple disconnects may occur)
-
-## USB Drive Structure
-
-When in UMS mode, the virtual drive contains:
-
-```
-/
-├── settings.toml        # Device settings (bidirectional)
-├── onboot.sh            # User boot script (bidirectional, validated on copy-back)
-├── wireguard/           # WireGuard VPN configs (bidirectional)
-│   └── *.conf
-├── radio-gaga/
-│   └── config.yaml      # Telemetry uplink config (bidirectional)
-├── uplink-service/
-│   └── config.yaml      # Uplink service config (bidirectional)
-├── system-update/       # Place .mender files here (write-in only)
-│   ├── librescoot-mdb-*.mender
-│   └── librescoot-dbc-*.mender
-├── maps/                # Place map files here (write-in only)
-│   ├── *.mbtiles
-│   └── *tiles.tar or valhalla_tiles_*.tar, either plain or .zst
-├── log-bundles/         # Saved diagnostic bundles from `lsc logs` (read-only)
-│   └── logs-*.tar.gz
-└── diagnostics/         # Live system info captured each cycle (read-only)
-    ├── mdb/
-    └── dbc/
-```
-
-## Startup & post-cycle cleanup
-
-On boot and again after every UMS cycle, ums-service performs housekeeping:
-
-- **Log bundles**: keep only the 10 most recent `/data/log-bundles/logs-*.tar.gz`.
-- **OTA artifacts**:
-  - Remove any `*.mender` / `*.delta` outside the managed dirs (`mdb`, `dbc`, `mdb-boot`, `dbc-boot`).
-  - In `mdb/` and `dbc/`, keep only the newest version per channel group (semver-aware for v-prefixed stable versions, lexicographic for ISO-timestamped nightly/testing).
-  - In `mdb-boot/` and `dbc-boot/`, keep the 5 newest per group.
-
-Post-cycle cleanup skips pruning of `/data/ota/{mdb,dbc}` because update-service installs queued .mender files asynchronously after our LPush; the next boot's full cleanup sweeps them.
-
-## Diagnostics
-
-Each UMS cycle captures `journal.log`, `dmesg.log` and `system-info.txt` for the
-MDB, plus the same three for the DBC when it answers on 192.168.7.2.
-
-The MDB `system-info.txt` ends with a `=== modem ===` section read from the
-`internet` and `modem` Redis hashes: IMEI, ICCID and IMSI first, then operator,
-access tech, signal, registration, connectivity, IP and the modem health /
-SIM / PIN / APN state. Fields Redis has no value for print as `-`. This is
-where to look for the identifiers connectivity onboarding asks for.
-
-## File Processing
-
-### When switching to UMS mode:
-1. Copies `/data/settings.toml` to USB drive (if exists)
-2. Copies `/data/wireguard/*.conf` to USB `wireguard/` directory
-3. Copies `/data/radio-gaga/config.yaml` to USB `radio-gaga/` directory
-4. Copies `/data/uplink-service/config.yaml` to USB `uplink-service/` directory
-5. Copies `/data/onboot.sh` to USB drive (if exists)
-6. Copies `/data/log-bundles/logs-*.tar.gz` to USB `log-bundles/` directory
-7. Creates `system-update` and `maps` directories
-8. Captures live diagnostics into USB `diagnostics/` directory
-
-### When switching to normal mode:
-1. **Settings**: Copies settings.toml back; restarts settings-service if changed
-2. **WireGuard**:
-   - Syncs *.conf files from USB to `/data/wireguard/`
-   - Removes local configs not present on USB
-   - Restarts settings-service if changed
-3. **radio-gaga**: Copies USB `radio-gaga/config.yaml` back; restarts `radio-gaga.service` if changed
-4. **uplink-service**: Copies USB `uplink-service/config.yaml` back; restarts `librescoot-uplink.service` if changed
-5. **onboot.sh**: Validates shebang and shell syntax (`<interp> -n`, falling back to `/bin/sh -n`); installs and chmods +x if valid, otherwise leaves the existing script untouched
-6. **Updates**:
-   - MDB updates: Installs locally and marks for reboot
-   - DBC updates: Transfers to DBC and installs remotely
-7. **Maps**: Transfers map files to DBC. A routing archive dropped on the stick as `.tar.zst` is uploaded compressed and decompressed on the DBC, into a temp file that only replaces `/data/valhalla/tiles.tar` once the whole stream has decoded. Valhalla mmaps that file, so what gets installed is always the plain seekable tar.
-8. Runs post-cycle cleanup (see above)
-9. Cleans the USB drive
-10. Reboots if required by updates
-
-## Building
-
-```bash
-# Build for ARM7 (default)
-make build
-
-# Build for AMD64
-make build-amd64
-
-# Clean build artifacts
-make clean
-
-# Run linter
-make lint
-
-# Run tests
+```sh
+make build        # bin/ums-service for ARMv7
+make build-amd64  # bin/ums-service-amd64
 make test
 ```
 
-## Running
+`make lint` and `make clean` are also available.
 
-The service requires root privileges to manage USB gadget modules:
+## Deployment and runtime dependencies
 
-```bash
-sudo ./bin/ums-service
+The image recipe installs `/usr/bin/ums-service` and `librescoot-ums.service`. The unit runs as `root`, requires `valkey.service`, starts after the vehicle service, and restarts automatically.
+
+Runtime operation requires:
+
+- Redis or Valkey and the services that consume queued update/hardware/power commands;
+- kernel USB gadget support, `g_ether`, and `g_mass_storage`;
+- `modprobe` and `rmmod` for gadget switching;
+- filesystem and mount tooling sufficient to create, format, mount, and unmount the virtual drive;
+- writable `/data` storage; and
+- the configured DBC interface for DBC updates, maps, RPMs, or scripts.
+
+```sh
+systemctl status librescoot-ums.service
+journalctl -u librescoot-ums.service
 ```
 
-## File Locations
+## Operational and security notes
 
-- Virtual USB drive: `/data/usb.drive`
-- Settings: `/data/settings.toml`
-- Boot script: `/data/onboot.sh`
-- WireGuard configs: `/data/wireguard/`
-- radio-gaga config: `/data/radio-gaga/config.yaml`
-- uplink-service config: `/data/uplink-service/config.yaml`
-- Updates: `/data/ota/{mdb,dbc,mdb-boot,dbc-boot}/`
-- Log bundles: `/data/log-bundles/logs-*.tar.gz`
-- DBC files: `/data/dbc/`
-
-## Dashboard Computer (DBC)
-
-The service manages the Dashboard Computer connection:
-- IP: `192.168.7.2`
-- HTTP server: `192.168.7.1:31337`
-- Enabled/disabled via `/usr/bin/keycard.sh`
-- File transfers via SSH/SCP
-
-## Logging
-
-The service logs all operations including:
-- Mode changes
-- File transfers
-- USB module loading/unloading
-- DBC connectivity status
-- Error conditions
-
-## Security Notes
-
-- SSH connections to DBC use `StrictHostKeyChecking=no`
-- The service requires root access for kernel module operations
-- Files are transferred with standard permissions (0644)
+- The systemd unit is intentionally privileged because it loads kernel modules, mounts storage, manages service configuration, and can initiate update/reboot workflows. Do not expose `usb.mode` writes to untrusted Redis/Valkey clients.
+- Treat files placed on the UMS drive as privileged inputs. In particular, updates, scripts, VPN configuration, and `onboot.sh` can alter a vehicle after the drive is disconnected.
+- The service validates `onboot.sh` syntax before installing it, but that does not make its contents safe. Only supply scripts from trusted operators.
+- Update-triggered reboot is limited to the vehicle states `stand-by`, `parked`, and `shutting-down`; inspect `usb` and `ota` status plus the journal when a cycle remains in `awaiting-reboot`.
+- Stop the service with `SIGTERM` or `SIGINT`; its USB monitor is stopped as part of context shutdown.
 
 ## License
 
-This project is dual-licensed. The source code is available under the
-[Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International License][cc-by-nc-sa].
-The maintainers reserve the right to grant separate licenses for commercial distribution; please contact the maintainers to discuss commercial licensing.
-
-[![CC BY-NC-SA 4.0][cc-by-nc-sa-image]][cc-by-nc-sa]
-
-[cc-by-nc-sa]: http://creativecommons.org/licenses/by-nc-sa/4.0/
-[cc-by-nc-sa-image]: https://licensebuttons.net/l/by-nc-sa/4.0/88x31.png
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
-
----
+This project is licensed under the [Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International License](LICENSE).
 
 Made with ❤️ by the Librescoot community

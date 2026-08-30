@@ -27,8 +27,8 @@ func (m *Manager) PrepareUSB(usbMountPath string) error {
 	return nil
 }
 
+// CopyToUSB exports local .conf files; it does not remove stale USB files.
 func (m *Manager) CopyToUSB(usbMountPath string) error {
-	// Ensure config directory exists
 	if _, err := os.Stat(m.configDir); os.IsNotExist(err) {
 		log.Printf("WireGuard config directory %s does not exist, skipping", m.configDir)
 		return nil
@@ -36,7 +36,6 @@ func (m *Manager) CopyToUSB(usbMountPath string) error {
 
 	destDir := filepath.Join(usbMountPath, "wireguard")
 
-	// Read all .conf files
 	entries, err := os.ReadDir(m.configDir)
 	if err != nil {
 		return fmt.Errorf("failed to read wireguard directory: %w", err)
@@ -75,24 +74,22 @@ func (m *Manager) CopyToUSB(usbMountPath string) error {
 	return nil
 }
 
+// SyncFromUSB treats the USB wireguard directory as authoritative: local .conf files
+// absent there are removed, including when the directory is empty.
 func (m *Manager) SyncFromUSB(usbMountPath string) (bool, error) {
 	srcDir := filepath.Join(usbMountPath, "wireguard")
 
-	// Check if USB wireguard directory exists
 	if _, err := os.Stat(srcDir); os.IsNotExist(err) {
 		log.Printf("No wireguard directory found on USB drive")
 		return false, nil
 	}
 
-	// Ensure local config directory exists
 	if err := os.MkdirAll(m.configDir, 0755); err != nil {
 		return false, fmt.Errorf("failed to create wireguard config directory: %w", err)
 	}
 
-	// Track changes
 	changed := false
 
-	// Get list of existing files
 	existingFiles := make(map[string]bool)
 	if entries, err := os.ReadDir(m.configDir); err == nil {
 		for _, entry := range entries {
@@ -102,13 +99,11 @@ func (m *Manager) SyncFromUSB(usbMountPath string) (bool, error) {
 		}
 	}
 
-	// Read files from USB
 	usbEntries, err := os.ReadDir(srcDir)
 	if err != nil {
 		return false, fmt.Errorf("failed to read USB wireguard directory: %w", err)
 	}
 
-	// Process files from USB
 	processedFiles := make(map[string]bool)
 	for _, entry := range usbEntries {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".conf") {
@@ -121,14 +116,12 @@ func (m *Manager) SyncFromUSB(usbMountPath string) (bool, error) {
 		srcPath := filepath.Join(srcDir, filename)
 		destPath := filepath.Join(m.configDir, filename)
 
-		// Read the file content
 		input, err := os.ReadFile(srcPath)
 		if err != nil {
 			log.Printf("Failed to read %s: %v", srcPath, err)
 			continue
 		}
 
-		// Check if file exists and has different content
 		needUpdate := true
 		if existing, err := os.ReadFile(destPath); err == nil {
 			needUpdate = string(existing) != string(input)
@@ -144,7 +137,6 @@ func (m *Manager) SyncFromUSB(usbMountPath string) (bool, error) {
 		}
 	}
 
-	// Remove files that don't exist on USB
 	for filename := range existingFiles {
 		if !processedFiles[filename] {
 			filePath := filepath.Join(m.configDir, filename)
@@ -157,7 +149,6 @@ func (m *Manager) SyncFromUSB(usbMountPath string) (bool, error) {
 		}
 	}
 
-	// If no files on USB, remove all local configs
 	if len(processedFiles) == 0 && len(existingFiles) > 0 {
 		for filename := range existingFiles {
 			filePath := filepath.Join(m.configDir, filename)
