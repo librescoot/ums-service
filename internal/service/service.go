@@ -447,6 +447,7 @@ func (s *Service) switchToNormal(prevMode string) error {
 	}
 	logger.ClearProgress()
 
+	s.setStep("packages")
 	if err := s.rpmInstaller.ProcessRPMs(ctx, s.config.RPMTransferTimeout, logger, mountPoint); err != nil {
 		logger.Error("rpms", "%v", err)
 		log.Printf("Error processing RPMs: %v", err)
@@ -455,6 +456,7 @@ func (s *Service) switchToNormal(prevMode string) error {
 	}
 	logger.ClearProgress()
 
+	s.setStep("scripts")
 	if err := s.scriptRunner.ProcessScripts(ctx, s.config.ScriptTransferTimeout, logger, mountPoint); err != nil {
 		logger.Error("scripts", "%v", err)
 		log.Printf("Error processing scripts: %v", err)
@@ -575,6 +577,14 @@ func (s *Service) awaitInstallsAndReboot(ctx context.Context, queued update.Queu
 		log.Printf("awaiter: skip reboot, vehicle state is %q", state)
 		return
 	}
+
+	// Installation is complete and the safety gate has passed. Expose the
+	// short final phase explicitly so the dashboard does not keep describing
+	// an already-finished install as merely awaiting a reboot.
+	s.setStatus("rebooting")
+	// Give the DBC enough time to paint the final state before its power-off
+	// command is consumed. This runs only in the background awaiter.
+	time.Sleep(500 * time.Millisecond)
 
 	if queued.MDB {
 		if _, err := s.client.LPush("scooter:power", "reboot"); err != nil {

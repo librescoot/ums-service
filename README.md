@@ -31,7 +31,7 @@ Supported modes are:
 | `ums` | Presents the virtual mass-storage drive; the first detected USB-host detach returns to normal mode. |
 | `ums-by-dbc` | Presents the same drive but waits for a second detected detach before returning to normal mode. |
 
-At startup the service seeds `usb.mode=normal` and `usb.status=idle`. During a cycle it publishes statuses including `preparing`, `active`, `processing`, `awaiting-reboot`, and `idle`; `usb.step` identifies the current import stage. Per-cycle detail is also written to the virtual drive as `ums_log.txt`.
+At startup the service seeds `usb.mode=normal` and `usb.status=idle`. During a cycle it publishes statuses including `preparing`, `active`, `processing`, `awaiting-reboot`, `rebooting`, and `idle`; `usb.step` identifies the current import stage. Per-cycle detail is also written to the virtual drive as `ums_log.txt`.
 
 The exported drive contains managed areas for `settings.toml`, `wireguard/`, `radio-gaga/`, `uplink-service/`, `onboot.sh`, `system-update/`, `maps/`, `rpms/`, `scripts/`, `log-bundles/`, and `diagnostics/`. On return to normal mode, the service copies supported configuration back to its managed locations, processes imports, restarts affected services when configuration changed, cleans the drive, and unmounts it.
 
