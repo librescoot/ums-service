@@ -270,10 +270,10 @@ func (i *Interface) UploadFile(ctx context.Context, localPath, remotePath string
 	// here rather than burdening each caller with the distinction.
 	urlPath := remotePath
 	if i.uploadServerKind == uploadServerDataServer {
-		urlPath = strings.TrimPrefix(remotePath, "/data")
-		if urlPath == "" || urlPath[0] != '/' {
+		if !strings.HasPrefix(remotePath, "/data/") {
 			return fmt.Errorf("data-server mode requires remotePath under /data, got %q", remotePath)
 		}
+		urlPath = strings.TrimPrefix(remotePath, "/data")
 	}
 	url := fmt.Sprintf("http://%s:%d%s", i.ip, uploadServerPort, urlPath)
 
