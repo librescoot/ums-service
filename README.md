@@ -9,7 +9,7 @@ The UMS Service provides the vehicle's USB gadget workflow. It switches the MDB 
 - Creates and manages a 1 GiB FAT-backed virtual drive at `/data/usb.drive` by default.
 - Exports and imports settings, WireGuard configuration, selected service configuration, and an optional boot script.
 - Queues MDB and DBC Mender update artifacts, transfers DBC-bound content through the DBC interface, and waits for queued installation status before a permitted reboot.
-- Imports supported map archives, RPMs, and MDB/DBC scripts.
+- Imports supported map archives and MDB/DBC scripts.
 - Collects diagnostics and exposes saved log bundles on the virtual drive.
 - Tracks USB attach/detach state, supports the two-detach `ums-by-dbc` flow, and updates the `usb` Redis/Valkey hash with mode, status, and processing step.
 - Prunes retained log bundles and stale OTA artifacts at startup and after UMS cycles.
@@ -33,7 +33,7 @@ Supported modes are:
 
 At startup the service seeds `usb.mode=normal` and `usb.status=idle`. During a cycle it publishes statuses including `preparing`, `active`, `processing`, `awaiting-reboot`, `rebooting`, and `idle`; `usb.step` identifies the current import stage. Per-cycle detail is also written to the virtual drive as `ums_log.txt`.
 
-The exported drive contains managed areas for `settings.toml`, `wireguard/`, `radio-gaga/`, `uplink-service/`, `onboot.sh`, `system-update/`, `maps/`, `rpms/`, `scripts/`, `log-bundles/`, and `diagnostics/`. On return to normal mode, the service copies supported configuration back to its managed locations, processes imports, restarts affected services when configuration changed, cleans the drive, and unmounts it.
+The exported drive contains managed areas for `settings.toml`, `wireguard/`, `radio-gaga/`, `uplink-service/`, `onboot.sh`, `system-update/`, `maps/`, `scripts/`, `log-bundles/`, and `diagnostics/`. On return to normal mode, the service copies supported configuration back to its managed locations, processes imports, restarts affected services when configuration changed, cleans the drive, and unmounts it.
 
 Do not remove the virtual drive file or force-unload its gadget module while a host is writing it. Let the host detach and allow the service to complete its processing cycle.
 
@@ -46,7 +46,6 @@ The service has no general command-line configuration; `--version` or `-version`
 | `REDIS_ADDR` | `localhost:6379` | Redis/Valkey address |
 | `REDIS_PASSWORD` | empty | Read into configuration but not currently passed to the Redis/Valkey IPC client |
 | `UMS_MAP_TIMEOUT` | `10m` | Per-map DBC-transfer timeout |
-| `UMS_RPM_TIMEOUT` | `5m` | Per-RPM DBC-transfer timeout |
 | `UMS_SCRIPT_TIMEOUT` | `2m` | Per-script DBC-transfer timeout |
 | `UMS_MENDER_TIMEOUT` | `15m` | Per-Mender DBC-transfer timeout |
 
@@ -75,7 +74,7 @@ Runtime operation requires:
 - `modprobe` and `rmmod` for gadget switching;
 - filesystem and mount tooling sufficient to create, format, mount, and unmount the virtual drive;
 - writable `/data` storage; and
-- the configured DBC interface for DBC updates, maps, RPMs, or scripts.
+- the configured DBC interface for DBC updates, maps, or scripts.
 
 ```sh
 systemctl status librescoot-ums.service

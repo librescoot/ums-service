@@ -108,7 +108,7 @@ func (c *Collector) writeDBCCommand(dir, filename, command string) {
 }
 
 func (c *Collector) writeDBCSystemInfo(dir string) {
-	cmd := `printf '=== uptime ===\n'; uptime; printf '\n=== disk usage ===\n'; df -h; printf '\n=== memory ===\n'; free -m; printf '\n=== installed packages ===\n'; rpm -qa --last 2>/dev/null | head -50`
+	cmd := `printf '=== uptime ===\n'; uptime; printf '\n=== disk usage ===\n'; df -h; printf '\n=== memory ===\n'; free -m`
 	output, err := c.runDBCCommand(cmd)
 	if err != nil {
 		log.Printf("Failed to collect DBC system info: %v", err)
@@ -128,7 +128,6 @@ func (c *Collector) writeMDBSystemInfo(dir string) {
 		{"uptime", "uptime", nil},
 		{"disk usage", "df", []string{"-h"}},
 		{"memory", "free", []string{"-m"}},
-		{"installed packages", "rpm", []string{"-qa", "--last"}},
 	}
 
 	var content string

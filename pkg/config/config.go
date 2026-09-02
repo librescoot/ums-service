@@ -17,7 +17,6 @@ type Config struct {
 	// upload (HTTP PUT + SCP fallback) for one file, so they need to
 	// fit the slow path. Override via env.
 	MapTransferTimeout    time.Duration
-	RPMTransferTimeout    time.Duration
 	ScriptTransferTimeout time.Duration
 	MenderTransferTimeout time.Duration
 }
@@ -30,7 +29,6 @@ func New() *Config {
 		USBDriveFile:          "/data/usb.drive",
 		USBDriveSize:          1024 * 1024 * 1024, // 1GB
 		MapTransferTimeout:    getDuration("UMS_MAP_TIMEOUT", 10*time.Minute),
-		RPMTransferTimeout:    getDuration("UMS_RPM_TIMEOUT", 5*time.Minute),
 		ScriptTransferTimeout: getDuration("UMS_SCRIPT_TIMEOUT", 2*time.Minute),
 		MenderTransferTimeout: getDuration("UMS_MENDER_TIMEOUT", 15*time.Minute),
 	}

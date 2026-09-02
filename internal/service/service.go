@@ -23,7 +23,6 @@ import (
 	"github.com/librescoot/ums-service/pkg/maps"
 	"github.com/librescoot/ums-service/pkg/onboot"
 	"github.com/librescoot/ums-service/pkg/radiogaga"
-	"github.com/librescoot/ums-service/pkg/rpm"
 	"github.com/librescoot/ums-service/pkg/scripts"
 	"github.com/librescoot/ums-service/pkg/settings"
 	"github.com/librescoot/ums-service/pkg/umslog"
@@ -56,7 +55,6 @@ type Service struct {
 	mapsUpdater   *maps.Updater
 	wgManager     *wireguard.Manager
 	diagnostics   *diagnostics.Collector
-	rpmInstaller  *rpm.Installer
 	scriptRunner  *scripts.Runner
 	logBundlesMgr *logbundles.Manager
 	radioGagaMgr  *radiogaga.Manager
@@ -99,7 +97,6 @@ func New(cfg *config.Config) (*Service, error) {
 	wgManager := wireguard.New()
 
 	updateLdr := update.New(client, dbcInterface)
-	rpmInstaller := rpm.New(dbcInterface)
 	scriptRunner := scripts.New(dbcInterface)
 
 	svc := &Service{
@@ -115,7 +112,6 @@ func New(cfg *config.Config) (*Service, error) {
 		mapsUpdater:   mapsUpdater,
 		wgManager:     wgManager,
 		diagnostics:   diagnostics.New(client),
-		rpmInstaller:  rpmInstaller,
 		scriptRunner:  scriptRunner,
 		logBundlesMgr: logbundles.New(),
 		radioGagaMgr:  radiogaga.New(),
@@ -298,10 +294,6 @@ func (s *Service) switchToUMS(mode string) error {
 
 	s.diagnostics.CollectToUSB(mountPoint)
 
-	if err := s.rpmInstaller.PrepareUSB(mountPoint); err != nil {
-		log.Printf("Error preparing rpms directory: %v", err)
-	}
-
 	if err := s.scriptRunner.PrepareUSB(mountPoint); err != nil {
 		log.Printf("Error preparing scripts directory: %v", err)
 	}
@@ -444,15 +436,6 @@ func (s *Service) switchToNormal(prevMode string) error {
 		log.Printf("Error processing maps: %v", err)
 	} else {
 		logger.Logf("maps", "done")
-	}
-	logger.ClearProgress()
-
-	s.setStep("packages")
-	if err := s.rpmInstaller.ProcessRPMs(ctx, s.config.RPMTransferTimeout, logger, mountPoint); err != nil {
-		logger.Error("rpms", "%v", err)
-		log.Printf("Error processing RPMs: %v", err)
-	} else {
-		logger.Logf("rpms", "done")
 	}
 	logger.ClearProgress()
 
@@ -629,16 +612,6 @@ func (s *Service) checkIfDBCNeeded(mountPoint string) bool {
 					log.Println("Found map files, DBC needed")
 					return true
 				}
-			}
-		}
-	}
-
-	dbcRPMDir := filepath.Join(mountPoint, "rpms", "dbc")
-	if entries, err := os.ReadDir(dbcRPMDir); err == nil {
-		for _, entry := range entries {
-			if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".rpm") {
-				log.Println("Found DBC RPM files, DBC needed")
-				return true
 			}
 		}
 	}
