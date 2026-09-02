@@ -15,13 +15,42 @@ import (
 // uploadServerPort is where the Python PUT server listens on the DBC.
 const uploadServerPort = 8080
 
+const (
+	// The DBC's dropbear is socket-activated: port 22 accepts long before a
+	// session can be served on a booting board.
+	uploadBootstrapTimeout = 30 * time.Second
+	// uploadReadyTimeout bounds the probe loop after the ssh returned.
+	uploadReadyTimeout = 10 * time.Second
+	// uploadLogFetchTimeout bounds the diagnostic read of upload_srv.log.
+	uploadLogFetchTimeout = 5 * time.Second
+)
+
+// execCommand is swapped out by tests to stand in for ssh.
+var execCommand = exec.CommandContext
+
+// cat reads the script from ssh stdin; the subshell orphans python with no
+// channel fds, so the login shell exits at once and sshd closes the session.
+const uploadServerStartCmd = "cat > /tmp/upload_srv.py && " +
+	"(python3 /tmp/upload_srv.py < /dev/null > /tmp/upload_srv.log 2>&1 &)"
+
+// uploadServerStopCmd tears down a bootstrapped server.
+const uploadServerStopCmd = "sync; kill $(cat /tmp/upload_srv.pid 2>/dev/null) 2>/dev/null; " +
+	"rm -f /tmp/upload_srv.pid /tmp/upload_srv.py /tmp/upload_srv.log"
+
 // uploadServerScript is a minimal http.server-based PUT endpoint that writes
 // each incoming request body straight to the URL path on disk. Matches the
 // installer trampoline (installer/assets/trampoline.sh.template:645-673) so
 // behavior is identical for large-file uploads.
-const uploadServerScript = `import http.server
-import os
+const uploadServerScript = `import os
 import sys
+
+# Detach from the ssh session's process group before anything else.
+try:
+    os.setsid()
+except OSError:
+    pass
+
+import http.server
 
 class H(http.server.BaseHTTPRequestHandler):
     def do_PUT(self):
@@ -77,55 +106,76 @@ const dataServerHeaderPrefix = "librescoot-data-server/"
 // startUploadServer establishes an HTTP PUT endpoint on the DBC for
 // fast file transfers. Preference order:
 //
-//  1. If librescoot-data-server is already running on 8080 (detected
-//     via its Server: header), use that directly — no bootstrap needed.
+//  1. If librescoot-data-server is already running on the upload port
+//     (detected via its Server: header), use that directly.
 //  2. Otherwise, write /tmp/upload_srv.py over SSH and launch it
-//     detached via nohup, matching the installer trampoline pattern.
-//  3. If both fail, return error — callers fall through to SCP.
+//     detached, matching the installer trampoline pattern.
+//  3. If both fail, return error; callers fall through to SCP.
 func (i *Interface) startUploadServer(ctx context.Context) error {
 	if kind, ok := i.probeUploadServer(ctx); ok {
 		i.uploadServerKind = kind
-		log.Printf("DBC upload server: using existing %s on %s:%d", kindName(kind), i.ip, uploadServerPort)
+		log.Printf("DBC upload server: using existing %s on %s:%d", kindName(kind), i.ip, i.uploadPort)
 		return nil
 	}
 
-	script := strings.Replace(uploadServerScript, "PORT", fmt.Sprintf("%d", uploadServerPort), 1)
+	script := strings.Replace(uploadServerScript, "PORT", fmt.Sprintf("%d", i.uploadPort), 1)
 
-	// Write the script (cat runs foreground so it actually reads stdin),
-	// THEN background the python server. The `&` must only apply to nohup —
-	// if it covers the `cat &&` chain, the shell backgrounds the whole thing,
-	// closes the ssh session's stdin immediately, and cat writes an empty file.
-	// `< /dev/null` on python prevents it from holding the ssh channel open.
-	remoteCmd := "cat > /tmp/upload_srv.py; " +
-		"nohup python3 /tmp/upload_srv.py > /tmp/upload_srv.log 2>&1 < /dev/null &"
-
-	sshCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	sshCtx, cancel := context.WithTimeout(ctx, i.bootstrapTimeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(sshCtx, "ssh",
+	cmd := execCommand(sshCtx, "ssh",
 		"-y",
 		fmt.Sprintf("root@%s", i.ip),
-		remoteCmd)
+		uploadServerStartCmd)
 	cmd.Stdin = strings.NewReader(script)
+	// Do not let a pipe holder that outlives the killed ssh eat the budget.
+	cmd.WaitDelay = time.Second
 
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("failed to start DBC upload server: %w (output: %s)", err, string(out))
 	}
 
-	// Wait up to 10s for the bootstrapped server to come up.
-	deadline := time.Now().Add(10 * time.Second)
+	if err := i.awaitUploadServer(ctx, i.readyTimeout); err != nil {
+		return err
+	}
+	log.Printf("DBC upload server ready on %s:%d (%s)", i.ip, i.uploadPort, kindName(i.uploadServerKind))
+	return nil
+}
+
+// awaitUploadServer polls the upload port; on timeout the error carries the
+// tail of upload_srv.log.
+func (i *Interface) awaitUploadServer(ctx context.Context, budget time.Duration) error {
+	deadline := time.Now().Add(budget)
 	for time.Now().Before(deadline) {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		if kind, ok := i.probeUploadServer(ctx); ok {
 			i.uploadServerKind = kind
-			log.Printf("DBC upload server ready on %s:%d (%s)", i.ip, uploadServerPort, kindName(kind))
 			return nil
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	return fmt.Errorf("DBC upload server did not become ready within 10s")
+	err := fmt.Errorf("DBC upload server did not become ready within %s", budget)
+	if tail := i.uploadServerLogTail(ctx); tail != "" {
+		err = fmt.Errorf("%w (upload_srv.log: %s)", err, tail)
+	}
+	return err
+}
+
+func (i *Interface) uploadServerLogTail(ctx context.Context) string {
+	logCtx, cancel := context.WithTimeout(ctx, uploadLogFetchTimeout)
+	defer cancel()
+	cmd := execCommand(logCtx, "ssh",
+		"-y",
+		fmt.Sprintf("root@%s", i.ip),
+		"tail -n 5 /tmp/upload_srv.log 2>&1")
+	cmd.WaitDelay = time.Second
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
 }
 
 // probeUploadServer pokes the port with a GET / and classifies the
@@ -135,7 +185,7 @@ func (i *Interface) probeUploadServer(ctx context.Context) (uploadServerKind, bo
 	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 
-	url := fmt.Sprintf("http://%s:%d/", i.ip, uploadServerPort)
+	url := fmt.Sprintf("http://%s:%d/", i.ip, i.uploadPort)
 	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, url, nil)
 	if err != nil {
 		return uploadServerNone, false
@@ -193,11 +243,10 @@ func (i *Interface) stopUploadServer() {
 	case uploadServerDataServer:
 		remoteCmd = "sync"
 	case uploadServerBootstrapped:
-		remoteCmd = "sync; kill $(cat /tmp/upload_srv.pid 2>/dev/null) 2>/dev/null; " +
-			"rm -f /tmp/upload_srv.pid /tmp/upload_srv.py /tmp/upload_srv.log"
+		remoteCmd = uploadServerStopCmd
 	}
 
-	cmd := exec.CommandContext(ctx, "ssh",
+	cmd := execCommand(ctx, "ssh",
 		"-y",
 		fmt.Sprintf("root@%s", i.ip),
 		remoteCmd)
@@ -275,7 +324,7 @@ func (i *Interface) UploadFile(ctx context.Context, localPath, remotePath string
 		}
 		urlPath = strings.TrimPrefix(remotePath, "/data")
 	}
-	url := fmt.Sprintf("http://%s:%d%s", i.ip, uploadServerPort, urlPath)
+	url := fmt.Sprintf("http://%s:%d%s", i.ip, i.uploadPort, urlPath)
 
 	body := &progressReader{r: f, total: size, progress: progressCb}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, body)

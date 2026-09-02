@@ -49,6 +49,9 @@ type Interface struct {
 	enabled          bool
 	client           *ipc.Client
 	uploadServerKind uploadServerKind
+	uploadPort       int
+	bootstrapTimeout time.Duration
+	readyTimeout     time.Duration
 	heartbeatCancel  context.CancelFunc
 	heartbeatDone    chan struct{}
 	// dbcUpdateQueued is set when a DBC mender update has been
@@ -63,11 +66,14 @@ type Interface struct {
 
 func New(dataDir string, client *ipc.Client) *Interface {
 	return &Interface{
-		ip:      "192.168.7.2",
-		port:    31337,
-		dataDir: dataDir,
-		client:  client,
-		enabled: false,
+		ip:               "192.168.7.2",
+		port:             31337,
+		dataDir:          dataDir,
+		client:           client,
+		enabled:          false,
+		uploadPort:       uploadServerPort,
+		bootstrapTimeout: uploadBootstrapTimeout,
+		readyTimeout:     uploadReadyTimeout,
 	}
 }
 
