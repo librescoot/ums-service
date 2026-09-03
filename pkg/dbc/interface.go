@@ -21,6 +21,19 @@ import (
 // window and leaves slack for transient redis delays.
 const heartbeatInterval = 5 * time.Minute
 
+const (
+	// tcpProbeTimeout bounds the cheap fast-fail dial that precedes the ssh
+	// probe, so a DBC that is entirely down costs 2s rather than a full ssh
+	// timeout.
+	tcpProbeTimeout = 2 * time.Second
+	// sshProbeTimeout bounds one ssh probe. Kept short so reachableTimeout
+	// buys a useful number of retries rather than a handful of long waits.
+	sshProbeTimeout = 5 * time.Second
+	// reachableTimeout is the total budget for a DBC to start serving ssh
+	// after start-dbc powered it on.
+	reachableTimeout = 60 * time.Second
+)
+
 // uploadServerKind identifies which variant of HTTP PUT endpoint is
 // running on the DBC for a given Enable() cycle.
 type uploadServerKind int
@@ -107,7 +120,12 @@ func (i *Interface) Enable(ctx context.Context) error {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
-	timeout := time.After(60 * time.Second)
+	timeout := time.After(reachableTimeout)
+
+	// A booting DBC fails the probe for benign reasons; a broken key or a
+	// host-key mismatch fails it forever and looks identical from here, so
+	// carry the last reason into the timeout error.
+	var lastProbeErr error
 
 	for {
 		select {
@@ -118,22 +136,28 @@ func (i *Interface) Enable(ctx context.Context) error {
 			return ctx.Err()
 		case <-timeout:
 			i.releaseUpdateLock()
+			if lastProbeErr != nil {
+				return fmt.Errorf("timeout waiting for DBC to become reachable, last probe: %w", lastProbeErr)
+			}
 			return fmt.Errorf("timeout waiting for DBC to become reachable")
 		case <-ticker.C:
-			if i.isReachable() {
-				i.enabled = true
-				log.Println("DBC is now reachable")
-				if err := i.startHTTPServer(); err != nil {
-					i.releaseUpdateLock()
-					i.enabled = false
-					return err
-				}
-				if err := i.startUploadServer(ctx); err != nil {
-					log.Printf("DBC upload server failed to start, uploads will fall back to SCP: %v", err)
-				}
-				i.startHeartbeat()
-				return nil
+			if err := i.isReachable(ctx); err != nil {
+				lastProbeErr = err
+				continue
 			}
+
+			i.enabled = true
+			log.Println("DBC is now reachable")
+			if err := i.startHTTPServer(); err != nil {
+				i.releaseUpdateLock()
+				i.enabled = false
+				return err
+			}
+			if err := i.startUploadServer(ctx); err != nil {
+				log.Printf("DBC upload server failed to start, uploads will fall back to SCP: %v", err)
+			}
+			i.startHeartbeat()
+			return nil
 		}
 	}
 }
@@ -238,13 +262,25 @@ func (i *Interface) Disable() error {
 	return nil
 }
 
-func (i *Interface) isReachable() bool {
-	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:22", i.ip), 2*time.Second)
+// The DBC's sshd is socket-activated, so port 22 accepts a connection long
+// before a session can be served; only a completed command counts. The probe
+// is deliberately short: Enable retries it, and a long one would spend the
+// whole reachability budget on a handful of attempts.
+func (i *Interface) isReachable(ctx context.Context) error {
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:22", i.ip), tcpProbeTimeout)
 	if err != nil {
-		return false
+		return err
 	}
 	_ = conn.Close()
-	return true
+
+	probeCtx, cancel := context.WithTimeout(ctx, sshProbeTimeout)
+	defer cancel()
+
+	output, err := execCommand(probeCtx, "ssh", "-y", fmt.Sprintf("root@%s", i.ip), "true").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%v, output: %s", err, strings.TrimSpace(string(output)))
+	}
+	return nil
 }
 
 func (i *Interface) startHTTPServer() error {
