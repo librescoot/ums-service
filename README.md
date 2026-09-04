@@ -31,7 +31,9 @@ Supported modes are:
 | `ums` | Presents the virtual mass-storage drive; the first detected USB-host detach returns to normal mode. |
 | `ums-by-dbc` | Presents the same drive but waits for a second detected detach before returning to normal mode. |
 
-At startup the service seeds `usb.mode=normal` and `usb.status=idle`. During a cycle it publishes statuses including `preparing`, `active`, `processing`, `awaiting-reboot`, `rebooting`, and `idle`; `usb.step` identifies the current import stage. Per-cycle detail is also written to the virtual drive as `ums_log.txt`.
+At startup the service seeds `usb.mode=normal` and `usb.status=idle`. During a cycle it publishes statuses including `preparing`, `active`, `processing`, `awaiting-reboot`, `rebooting`, and `idle`; `usb.step` identifies the current import stage. While `awaiting-reboot`, the step names what the wait is on: `waiting-mdb`, `waiting-dbc`, `waiting-dbc+mdb`, then `waiting-vehicle-state`.
+
+When the reboot phase finishes, `usb.status` returns to `idle` and the outcome is recorded on `usb.last-result` (`reboot-triggered`, `timeout`, `install-error`, `vehicle-state`, or `error`), with `usb.last-result-detail` and `usb.last-result-time` alongside it. The next UMS entry clears all three. `lsc usb status` prints them, and `lsc usb log` shows the per-cycle entries from the `usb:log` list. Per-cycle detail is also written to the virtual drive as `ums_log.txt`.
 
 The exported drive contains managed areas for `settings.toml`, `wireguard/`, `radio-gaga/`, `uplink-service/`, `onboot.sh`, `system-update/`, `maps/`, `scripts/`, `log-bundles/`, and `diagnostics/`. On return to normal mode, the service copies supported configuration back to its managed locations, processes imports, restarts affected services when configuration changed, cleans the drive, and unmounts it.
 
@@ -86,7 +88,7 @@ journalctl -u librescoot-ums.service
 - The systemd unit is intentionally privileged because it loads kernel modules, mounts storage, manages service configuration, and can initiate update/reboot workflows. Do not expose `usb.mode` writes to untrusted Redis/Valkey clients.
 - Treat files placed on the UMS drive as privileged inputs. In particular, updates, scripts, VPN configuration, and `onboot.sh` can alter a vehicle after the drive is disconnected.
 - The service validates `onboot.sh` syntax before installing it, but that does not make its contents safe. Only supply scripts from trusted operators.
-- Update-triggered reboot is limited to the vehicle states `stand-by`, `parked`, and `shutting-down`; inspect `usb` and `ota` status plus the journal when a cycle remains in `awaiting-reboot`.
+- Update-triggered reboot is limited to the vehicle states `stand-by`, `parked`, and `shutting-down`; check `usb.step` for what a cycle in `awaiting-reboot` is waiting on, and `usb.last-result` for why one gave up.
 - Stop the service with `SIGTERM` or `SIGINT`; its USB monitor is stopped as part of context shutdown.
 
 ## License

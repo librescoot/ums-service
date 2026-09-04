@@ -3,6 +3,7 @@ package update
 import (
 	"context"
 	"fmt"
+	"sort"
 	"time"
 )
 
@@ -49,11 +50,13 @@ type awaiterState struct {
 // WaitForCompletion blocks until every component in q with its bool set
 // has transitioned to pending-reboot since the function was entered.
 //
+// onPending receives the sorted, non-empty set of unfinished components.
+//
 // Returns nil on success, an error wrapping context.DeadlineExceeded on
 // timeout, an error wrapping context.Canceled on ctx cancellation, or an
 // error naming the component that went to error status.
-func WaitForCompletion(ctx context.Context, source OTAStatusSource, q Queued, timeout time.Duration) error {
-	required := requiredComponents(q)
+func WaitForCompletion(ctx context.Context, source OTAStatusSource, q Queued, timeout time.Duration, onPending func([]string)) error {
+	required := RequiredComponents(q)
 	if len(required) == 0 {
 		return nil
 	}
@@ -70,6 +73,16 @@ func WaitForCompletion(ctx context.Context, source OTAStatusSource, q Queued, ti
 		}
 		states[c] = st
 	}
+
+	notify := func() {
+		if onPending == nil {
+			return
+		}
+		if p := pendingComponents(states); len(p) > 0 {
+			onPending(p)
+		}
+	}
+	notify()
 
 	waitCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -89,11 +102,12 @@ func WaitForCompletion(ctx context.Context, source OTAStatusSource, q Queued, ti
 			}
 			switch u.Status {
 			case statusPendingReboot:
-				if st.sawNonPendingReboot {
+				if st.sawNonPendingReboot && !st.done {
 					st.done = true
 					if allDone(states) {
 						return nil
 					}
+					notify()
 				}
 			case statusError:
 				if st.sawNonPendingReboot {
@@ -109,14 +123,26 @@ func WaitForCompletion(ctx context.Context, source OTAStatusSource, q Queued, ti
 	}
 }
 
-func requiredComponents(q Queued) []string {
+// RequiredComponents returns queued components in stable order.
+func RequiredComponents(q Queued) []string {
 	var out []string
-	if q.MDB {
-		out = append(out, "mdb")
-	}
 	if q.DBC {
 		out = append(out, "dbc")
 	}
+	if q.MDB {
+		out = append(out, "mdb")
+	}
+	return out
+}
+
+func pendingComponents(states map[string]*awaiterState) []string {
+	var out []string
+	for c, st := range states {
+		if !st.done {
+			out = append(out, c)
+		}
+	}
+	sort.Strings(out)
 	return out
 }
 

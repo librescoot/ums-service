@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -45,7 +46,7 @@ func TestWaitForCompletion_MDBOnly_HappyPath(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- WaitForCompletion(context.Background(), src, q, 2*time.Second)
+		done <- WaitForCompletion(context.Background(), src, q, 2*time.Second, nil)
 	}()
 
 	src.push("mdb", "installing")
@@ -67,7 +68,7 @@ func TestWaitForCompletion_DBCOnly_HappyPath(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- WaitForCompletion(context.Background(), src, q, 2*time.Second)
+		done <- WaitForCompletion(context.Background(), src, q, 2*time.Second, nil)
 	}()
 
 	src.push("dbc", "installing")
@@ -89,7 +90,7 @@ func TestWaitForCompletion_Both_BothMustComplete(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- WaitForCompletion(context.Background(), src, q, 2*time.Second)
+		done <- WaitForCompletion(context.Background(), src, q, 2*time.Second, nil)
 	}()
 
 	src.push("mdb", "installing")
@@ -125,7 +126,7 @@ func TestWaitForCompletion_InitialPendingRebootIsStale(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- WaitForCompletion(context.Background(), src, q, 2*time.Second)
+		done <- WaitForCompletion(context.Background(), src, q, 2*time.Second, nil)
 	}()
 
 	src.push("mdb", "downloading")
@@ -150,7 +151,7 @@ func TestWaitForCompletion_InitialPendingRebootThenError(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- WaitForCompletion(context.Background(), src, q, 2*time.Second)
+		done <- WaitForCompletion(context.Background(), src, q, 2*time.Second, nil)
 	}()
 
 	src.push("mdb", "downloading")
@@ -179,7 +180,7 @@ func TestWaitForCompletion_InitialErrorThenSuccess(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- WaitForCompletion(context.Background(), src, q, 2*time.Second)
+		done <- WaitForCompletion(context.Background(), src, q, 2*time.Second, nil)
 	}()
 
 	src.push("mdb", "installing")
@@ -200,7 +201,7 @@ func TestWaitForCompletion_Timeout(t *testing.T) {
 	q := Queued{MDB: true}
 
 	start := time.Now()
-	err := WaitForCompletion(context.Background(), src, q, 100*time.Millisecond)
+	err := WaitForCompletion(context.Background(), src, q, 100*time.Millisecond, nil)
 	elapsed := time.Since(start)
 
 	if err == nil {
@@ -221,7 +222,7 @@ func TestWaitForCompletion_ContextCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		done <- WaitForCompletion(ctx, src, q, 5*time.Second)
+		done <- WaitForCompletion(ctx, src, q, 5*time.Second, nil)
 	}()
 
 	time.Sleep(50 * time.Millisecond)
@@ -243,7 +244,7 @@ func TestWaitForCompletion_NothingQueued(t *testing.T) {
 	src := newFakeOTASource(map[string]string{})
 	q := Queued{}
 
-	err := WaitForCompletion(context.Background(), src, q, 1*time.Second)
+	err := WaitForCompletion(context.Background(), src, q, 1*time.Second, nil)
 	if err != nil {
 		t.Errorf("expected nil error for empty Queued, got %v", err)
 	}
@@ -255,7 +256,7 @@ func TestWaitForCompletion_SourceClosed(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- WaitForCompletion(context.Background(), src, q, 5*time.Second)
+		done <- WaitForCompletion(context.Background(), src, q, 5*time.Second, nil)
 	}()
 
 	src.close()
@@ -267,5 +268,63 @@ func TestWaitForCompletion_SourceClosed(t *testing.T) {
 		}
 	case <-time.After(1 * time.Second):
 		t.Fatal("timed out")
+	}
+}
+
+func TestWaitForCompletion_OnPendingNarrowsAsComponentsFinish(t *testing.T) {
+	src := newFakeOTASource(map[string]string{"mdb": "idle", "dbc": "idle"})
+	q := Queued{MDB: true, DBC: true}
+
+	var mu sync.Mutex
+	var seen [][]string
+	onPending := func(pending []string) {
+		mu.Lock()
+		defer mu.Unlock()
+		seen = append(seen, pending)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- WaitForCompletion(context.Background(), src, q, 2*time.Second, onPending)
+	}()
+
+	src.push("mdb", "installing")
+	src.push("mdb", "pending-reboot")
+	src.push("dbc", "installing")
+	src.push("dbc", "pending-reboot")
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("expected nil, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for awaiter to return")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	want := [][]string{{"dbc", "mdb"}, {"dbc"}}
+	if len(seen) != len(want) {
+		t.Fatalf("expected %d onPending calls, got %d: %v", len(want), len(seen), seen)
+	}
+	for i := range want {
+		if strings.Join(seen[i], ",") != strings.Join(want[i], ",") {
+			t.Errorf("call %d: expected %v, got %v", i, want[i], seen[i])
+		}
+	}
+}
+
+func TestWaitForCompletion_OnPendingNotCalledWhenNothingQueued(t *testing.T) {
+	src := newFakeOTASource(nil)
+	called := false
+	err := WaitForCompletion(context.Background(), src, Queued{}, time.Second, func([]string) {
+		called = true
+	})
+	if err != nil {
+		t.Fatalf("expected nil, got %v", err)
+	}
+	if called {
+		t.Error("onPending should not be called when nothing is queued")
 	}
 }

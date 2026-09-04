@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -240,6 +241,8 @@ func (s *Service) switchToUMS(mode string) error {
 	if _, err := s.client.Del("usb:log"); err != nil {
 		log.Printf("Warning: failed to clear usb:log: %v", err)
 	}
+
+	s.clearResult()
 
 	if err := s.diskMgr.Mount(); err != nil {
 		s.setStatus("idle")
@@ -520,6 +523,7 @@ func (s *Service) awaitInstallsAndReboot(ctx context.Context, queued update.Queu
 		// If we were cancelled externally, whoever cancelled us
 		// (switchToUMS) already owns the status field; don't clobber.
 		if ctx.Err() == nil {
+			s.setStep("")
 			s.setStatus("idle")
 		}
 	}()
@@ -530,6 +534,7 @@ func (s *Service) awaitInstallsAndReboot(ctx context.Context, queued update.Queu
 	if err != nil {
 		logger.Error("reboot", "subscribe to ota hash: %v", err)
 		log.Printf("awaiter: subscribe failed: %v", err)
+		s.setResult(resultError, "could not watch the ota hash: %v", err)
 		return
 	}
 	defer source.Stop()
@@ -538,26 +543,47 @@ func (s *Service) awaitInstallsAndReboot(ctx context.Context, queued update.Queu
 		if _, perr := s.client.LPush(p.Channel, p.Value); perr != nil {
 			logger.Error("reboot", "LPush %s failed: %v", p.Channel, perr)
 			log.Printf("awaiter: LPush %s failed: %v", p.Channel, perr)
+			s.setResult(resultError, "could not queue install on %s: %v", p.Channel, perr)
 			return
 		}
 		logger.Logf("reboot", "queued %s", p.Channel)
 	}
 
-	if err := update.WaitForCompletion(ctx, source, queued, installAwaitTimeout); err != nil {
+	pending := update.RequiredComponents(queued)
+	onPending := func(components []string) {
+		pending = components
+		s.setStep("waiting-" + strings.Join(components, "+"))
+	}
+
+	if err := update.WaitForCompletion(ctx, source, queued, installAwaitTimeout, onPending); err != nil {
 		logger.Error("reboot", "skip: %v", err)
 		log.Printf("awaiter: skip reboot: %v", err)
+		switch {
+		case errors.Is(err, context.Canceled):
+			// A new UMS entry clears the superseded result.
+		case errors.Is(err, context.DeadlineExceeded):
+			s.setResult(resultTimeout, "install did not finish within %s (still waiting on %s)",
+				installAwaitTimeout, strings.Join(pending, ", "))
+		default:
+			s.setResult(resultInstallError, "%v", err)
+		}
 		return
 	}
+
+	s.setStep("waiting-vehicle-state")
 
 	state, err := s.client.HGet("vehicle", "state")
 	if err != nil {
 		logger.Error("reboot", "skip: failed to read vehicle state: %v", err)
 		log.Printf("awaiter: failed to read vehicle state: %v", err)
+		s.setResult(resultError, "could not read vehicle state: %v", err)
 		return
 	}
 	if !rebootAllowedVehicleStates[state] {
 		logger.Logf("reboot", "skip: vehicle state %q not in allowed set", state)
 		log.Printf("awaiter: skip reboot, vehicle state is %q", state)
+		s.setResult(resultVehicleState,
+			"install is staged but the reboot was skipped: vehicle state %q does not allow it", state)
 		return
 	}
 
@@ -573,8 +599,10 @@ func (s *Service) awaitInstallsAndReboot(ctx context.Context, queued update.Queu
 		if _, err := s.client.LPush("scooter:power", "reboot"); err != nil {
 			logger.Error("reboot", "LPush scooter:power reboot failed: %v", err)
 			log.Printf("awaiter: failed to trigger MDB reboot: %v", err)
+			s.setResult(resultError, "could not trigger the MDB reboot: %v", err)
 			return
 		}
+		s.setResult(resultRebootTriggered, "MDB reboot triggered")
 		logger.Logf("reboot", "MDB reboot triggered")
 		log.Println("awaiter: MDB reboot triggered")
 		return
@@ -585,9 +613,11 @@ func (s *Service) awaitInstallsAndReboot(ctx context.Context, queued update.Queu
 		if _, err := s.client.LPush("scooter:hardware", cmd); err != nil {
 			logger.Error("reboot", "LPush scooter:hardware %s failed: %v", cmd, err)
 			log.Printf("awaiter: failed to send %s: %v", cmd, err)
+			s.setResult(resultError, "could not power-cycle the DBC: %v", err)
 			return
 		}
 	}
+	s.setResult(resultRebootTriggered, "DBC power cycle triggered")
 	logger.Logf("reboot", "DBC power cycle triggered")
 	log.Println("awaiter: DBC power cycle triggered")
 }
@@ -718,6 +748,36 @@ func (s *Service) setLEDs(p ledPattern) {
 func (s *Service) setStatus(status string) {
 	if err := s.publisher.Set("status", status, ipc.Sync()); err != nil {
 		log.Printf("Error publishing usb status %q: %v", status, err)
+	}
+}
+
+const (
+	resultRebootTriggered = "reboot-triggered"
+	resultTimeout         = "timeout"
+	resultInstallError    = "install-error"
+	resultVehicleState    = "vehicle-state"
+	resultError           = "error"
+)
+
+func (s *Service) setResult(result, format string, args ...any) {
+	detail := fmt.Sprintf(format, args...)
+	if err := s.publisher.SetMany(map[string]any{
+		"last-result":        result,
+		"last-result-detail": detail,
+		"last-result-time":   time.Now().Format(time.RFC3339),
+	}, ipc.Sync()); err != nil {
+		log.Printf("Error publishing usb result %q: %v", result, err)
+	}
+	log.Printf("UMS cycle result: %s (%s)", result, detail)
+}
+
+func (s *Service) clearResult() {
+	if err := s.publisher.SetMany(map[string]any{
+		"last-result":        "",
+		"last-result-detail": "",
+		"last-result-time":   "",
+	}, ipc.Sync()); err != nil {
+		log.Printf("Error clearing usb result: %v", err)
 	}
 }
 
