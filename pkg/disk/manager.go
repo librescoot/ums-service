@@ -160,23 +160,59 @@ func (m *Manager) formatDrive(path string) error {
 }
 
 func (m *Manager) checkFilesystem() error {
-	cmd := exec.Command("fsck.fat", "-n", m.driveFile)
-	output, err := cmd.CombinedOutput()
+	output, err := exec.Command("fsck.fat", "-n", m.driveFile).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("fsck.fat failed: %v, output: %s", err, string(output))
 	}
 	return nil
 }
 
-func (m *Manager) Mount() error {
+func fsckRepaired(err error) bool {
+	if err == nil {
+		return true
+	}
+	exitErr, ok := err.(*exec.ExitError)
+	return ok && exitErr.ExitCode() == 1
+}
+
+func (m *Manager) repairFilesystem() error {
+	output, err := exec.Command("fsck.fat", "-a", m.driveFile).CombinedOutput()
+	if !fsckRepaired(err) {
+		return fmt.Errorf("fsck.fat repair failed: %v, output: %s", err, string(output))
+	}
 	if err := m.checkFilesystem(); err != nil {
-		log.Printf("Filesystem check failed: %v — recreating drive", err)
-		if err := os.Remove(m.driveFile); err != nil {
-			log.Printf("Failed to remove corrupted drive file %s: %v", m.driveFile, err)
+		return fmt.Errorf("filesystem remains inconsistent after repair: %w", err)
+	}
+	return nil
+}
+
+func (m *Manager) replaceCorruptDrive() (string, error) {
+	backupPath := m.driveFile + ".corrupt"
+	if err := os.Remove(backupPath); err != nil && !os.IsNotExist(err) {
+		return "", fmt.Errorf("remove previous recovery image: %w", err)
+	}
+	if err := os.Rename(m.driveFile, backupPath); err != nil {
+		return "", fmt.Errorf("preserve corrupted drive: %w", err)
+	}
+	if err := m.createAndFormatDrive(); err != nil {
+		_ = os.Remove(m.driveFile)
+		_ = os.Rename(backupPath, m.driveFile)
+		return "", fmt.Errorf("create replacement drive: %w", err)
+	}
+	return backupPath, nil
+}
+
+func (m *Manager) Mount() error {
+	if checkErr := m.checkFilesystem(); checkErr != nil {
+		log.Printf("Filesystem check failed: %v — attempting repair", checkErr)
+		if repairErr := m.repairFilesystem(); repairErr != nil {
+			backupPath, replaceErr := m.replaceCorruptDrive()
+			if replaceErr != nil {
+				return fmt.Errorf("filesystem is corrupt (%v), repair failed (%v), and replacement failed: %w", checkErr, repairErr, replaceErr)
+			}
+			return fmt.Errorf("filesystem was unrecoverable and was replaced; original saved at %s: %v", backupPath, repairErr)
 		}
-		if err := m.createAndFormatDrive(); err != nil {
-			return fmt.Errorf("failed to recreate drive after corruption: %w", err)
-		}
+		log.Println("Filesystem repaired successfully")
 	}
 
 	if err := os.MkdirAll(m.mountPoint, 0755); err != nil {

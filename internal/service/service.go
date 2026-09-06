@@ -245,6 +245,7 @@ func (s *Service) switchToUMS(mode string) error {
 	s.clearResult()
 
 	if err := s.diskMgr.Mount(); err != nil {
+		s.setResult(resultError, "could not prepare the USB drive: %v", err)
 		s.setStatus("idle")
 		return fmt.Errorf("failed to mount drive: %w", err)
 	}
@@ -355,6 +356,7 @@ func (s *Service) switchToNormal(prevMode string) error {
 	s.setStatus("processing")
 
 	if err := s.diskMgr.Mount(); err != nil {
+		s.setResult(resultError, "could not read the USB drive: %v", err)
 		s.setStep("")
 		s.setStatus("idle")
 		return fmt.Errorf("failed to mount drive: %w", err)

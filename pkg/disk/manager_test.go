@@ -2,6 +2,7 @@ package disk
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -65,9 +66,42 @@ func TestVolumeLabelFitsFAT(t *testing.T) {
 	}
 }
 
+func TestFsckRepairedAcceptsCorrectedExitStatus(t *testing.T) {
+	if !fsckRepaired(exec.Command("sh", "-c", "exit 1").Run()) {
+		t.Fatal("exit status 1 should mean filesystem errors were corrected")
+	}
+	if fsckRepaired(exec.Command("sh", "-c", "exit 4").Run()) {
+		t.Fatal("exit status 4 should mean filesystem errors remain")
+	}
+}
+
+func TestRepairFilesystemRechecksAfterCorrection(t *testing.T) {
+	dir := t.TempDir()
+	counter := filepath.Join(dir, "checks")
+	script := `#!/bin/sh
+if [ "$1" = "-a" ]; then exit 1; fi
+count=0
+[ ! -f "` + counter + `" ] || count=$(cat "` + counter + `")
+count=$((count + 1))
+printf %s "$count" > "` + counter + `"
+[ "$count" -gt 1 ]
+`
+	if err := os.WriteFile(filepath.Join(dir, "fsck.fat"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+
+	m := NewManager(filepath.Join(dir, "usb.drive"), 1<<20)
+	if err := m.checkFilesystem(); err == nil {
+		t.Fatal("initial check should report an inconsistency")
+	}
+	if err := m.repairFilesystem(); err != nil {
+		t.Fatalf("repairFilesystem: %v", err)
+	}
+}
+
 func TestCreateDriveFileReplacesAShorterFile(t *testing.T) {
-	// Mount() deletes and recreates the image when fsck fails, so creation
-	// has to overwrite whatever is already there rather than extend it.
+	// Replacement has to overwrite whatever is already there rather than extend it.
 	path := filepath.Join(t.TempDir(), "usb.drive")
 	if err := os.WriteFile(path, make([]byte, 4096), 0o600); err != nil {
 		t.Fatal(err)
