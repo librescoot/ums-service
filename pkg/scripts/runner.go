@@ -2,11 +2,13 @@ package scripts
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/librescoot/ums-service/pkg/dbc"
@@ -39,16 +41,15 @@ func (r *Runner) ProcessScripts(ctx context.Context, dbcTimeout time.Duration, l
 		return nil
 	}
 
-	r.runMDBScript(scriptsDir)
-	r.runDBCScript(ctx, dbcTimeout, logger, scriptsDir)
-
-	return nil
+	mdbErr := r.runMDBScript(scriptsDir)
+	dbcErr := r.runDBCScript(ctx, dbcTimeout, logger, scriptsDir)
+	return errors.Join(mdbErr, dbcErr)
 }
 
-func (r *Runner) runMDBScript(scriptsDir string) {
+func (r *Runner) runMDBScript(scriptsDir string) error {
 	srcPath := filepath.Join(scriptsDir, "mdb.sh")
 	if _, err := os.Stat(srcPath); os.IsNotExist(err) {
-		return
+		return nil
 	}
 
 	log.Println("Running MDB script")
@@ -56,34 +57,40 @@ func (r *Runner) runMDBScript(scriptsDir string) {
 	tmpPath := "/tmp/ums-mdb.sh"
 	input, err := os.ReadFile(srcPath)
 	if err != nil {
-		log.Printf("Failed to read mdb.sh: %v", err)
-		return
+		return fmt.Errorf("read mdb.sh: %w", err)
 	}
 
 	if err := os.WriteFile(tmpPath, input, 0755); err != nil {
-		log.Printf("Failed to write mdb.sh to temp: %v", err)
-		return
+		return fmt.Errorf("write temporary mdb.sh: %w", err)
 	}
+	defer os.Remove(tmpPath)
 
-	cmd := exec.Command("bash", tmpPath)
-	output, err := cmd.CombinedOutput()
+	output, err := exec.Command("bash", tmpPath).CombinedOutput()
 	if err != nil {
-		log.Printf("MDB script failed: %v, output: %s", err, string(output))
-		return
+		return scriptError("MDB script", err, output)
 	}
 
 	log.Printf("MDB script output: %s", string(output))
+	return nil
 }
 
-func (r *Runner) runDBCScript(ctx context.Context, timeout time.Duration, logger *umslog.Logger, scriptsDir string) {
+const maxErrorOutput = 4096
+
+func scriptError(name string, err error, output []byte) error {
+	if len(output) > maxErrorOutput {
+		output = output[len(output)-maxErrorOutput:]
+	}
+	return fmt.Errorf("%s failed: %w, output: %s", name, err, strings.TrimSpace(string(output)))
+}
+
+func (r *Runner) runDBCScript(ctx context.Context, timeout time.Duration, logger *umslog.Logger, scriptsDir string) error {
 	srcPath := filepath.Join(scriptsDir, "dbc.sh")
 	if _, err := os.Stat(srcPath); os.IsNotExist(err) {
-		return
+		return nil
 	}
 
 	if !r.dbcInterface.IsEnabled() {
-		log.Println("DBC interface not enabled, skipping dbc.sh")
-		return
+		return fmt.Errorf("DBC interface not enabled for dbc.sh")
 	}
 
 	log.Println("Running DBC script")
@@ -92,21 +99,28 @@ func (r *Runner) runDBCScript(ctx context.Context, timeout time.Duration, logger
 	defer cancel()
 
 	remotePath := "/tmp/dbc.sh"
+	defer func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(opCtx), 30*time.Second)
+		defer cleanupCancel()
+		if _, err := r.dbcInterface.RunCommand(cleanupCtx, "rm -f "+remotePath); err != nil {
+			log.Printf("Failed to remove temporary DBC script: %v", err)
+		}
+	}()
+
 	var progress dbc.ProgressFunc
 	if logger != nil {
 		progress = logger.ProgressCallback("dbc.sh")
 		defer logger.ClearProgress()
 	}
 	if err := r.dbcInterface.TransferFile(opCtx, srcPath, remotePath, progress); err != nil {
-		log.Printf("Failed to transfer dbc.sh to DBC: %v", err)
-		return
+		return fmt.Errorf("transfer dbc.sh: %w", err)
 	}
 
 	output, err := r.dbcInterface.RunCommand(opCtx, fmt.Sprintf("bash %s", remotePath))
 	if err != nil {
-		log.Printf("DBC script failed: %v", err)
-		return
+		return scriptError("DBC script", err, []byte(output))
 	}
 
 	log.Printf("DBC script output: %s", output)
+	return nil
 }
