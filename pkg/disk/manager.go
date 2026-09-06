@@ -186,31 +186,24 @@ func (m *Manager) repairFilesystem() error {
 	return nil
 }
 
-func (m *Manager) replaceCorruptDrive() (string, error) {
-	backupPath := m.driveFile + ".corrupt"
-	if err := os.Remove(backupPath); err != nil && !os.IsNotExist(err) {
-		return "", fmt.Errorf("remove previous recovery image: %w", err)
-	}
-	if err := os.Rename(m.driveFile, backupPath); err != nil {
-		return "", fmt.Errorf("preserve corrupted drive: %w", err)
+func (m *Manager) replaceCorruptDrive() error {
+	if err := os.Remove(m.driveFile); err != nil {
+		return fmt.Errorf("remove corrupted drive: %w", err)
 	}
 	if err := m.createAndFormatDrive(); err != nil {
-		_ = os.Remove(m.driveFile)
-		_ = os.Rename(backupPath, m.driveFile)
-		return "", fmt.Errorf("create replacement drive: %w", err)
+		return fmt.Errorf("create replacement drive: %w", err)
 	}
-	return backupPath, nil
+	return nil
 }
 
 func (m *Manager) Mount() error {
 	if checkErr := m.checkFilesystem(); checkErr != nil {
 		log.Printf("Filesystem check failed: %v — attempting repair", checkErr)
 		if repairErr := m.repairFilesystem(); repairErr != nil {
-			backupPath, replaceErr := m.replaceCorruptDrive()
-			if replaceErr != nil {
+			if replaceErr := m.replaceCorruptDrive(); replaceErr != nil {
 				return fmt.Errorf("filesystem is corrupt (%v), repair failed (%v), and replacement failed: %w", checkErr, repairErr, replaceErr)
 			}
-			return fmt.Errorf("filesystem was unrecoverable and was replaced; original saved at %s: %v", backupPath, repairErr)
+			return fmt.Errorf("filesystem was unrecoverable and was replaced; reconnect the USB drive, copy the files again, and retry: %v", repairErr)
 		}
 		log.Println("Filesystem repaired successfully")
 	}
