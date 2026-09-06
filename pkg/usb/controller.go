@@ -91,8 +91,19 @@ func (c *Controller) switchToNormal() error {
 	if err := c.loadModule("g_ether"); err != nil {
 		return fmt.Errorf("failed to load g_ether: %w", err)
 	}
+	if err := enableInterface("usb0"); err != nil {
+		return fmt.Errorf("failed to enable USB network interface: %w", err)
+	}
 
 	log.Println("Switched to normal mode")
+	return nil
+}
+
+func enableInterface(name string) error {
+	output, err := exec.Command("ip", "link", "set", name, "up").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("ip link set %s up failed: %v, output: %s", name, err, string(output))
+	}
 	return nil
 }
 
