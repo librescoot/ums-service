@@ -66,12 +66,18 @@ func TestVolumeLabelFitsFAT(t *testing.T) {
 	}
 }
 
-func TestFsckRepairedAcceptsCorrectedExitStatus(t *testing.T) {
-	if !fsckRepaired(exec.Command("sh", "-c", "exit 1").Run()) {
-		t.Fatal("exit status 1 should mean filesystem errors were corrected")
+func TestFilesystemErrorExitStatuses(t *testing.T) {
+	for _, code := range []int{1, 4} {
+		err := &fsckFailure{err: exec.Command("sh", "-c", "exit 1").Run(), exitCode: code}
+		if !hasFilesystemErrors(err) {
+			t.Errorf("exit status %d should indicate filesystem errors", code)
+		}
 	}
-	if fsckRepaired(exec.Command("sh", "-c", "exit 4").Run()) {
-		t.Fatal("exit status 4 should mean filesystem errors remain")
+	for _, code := range []int{-1, 2, 8} {
+		err := &fsckFailure{err: exec.Command("sh", "-c", "exit 1").Run(), exitCode: code}
+		if hasFilesystemErrors(err) {
+			t.Errorf("exit status %d should indicate a tool or operational failure", code)
+		}
 	}
 }
 
@@ -97,6 +103,30 @@ printf %s "$count" > "` + counter + `"
 	}
 	if err := m.repairFilesystem(); err != nil {
 		t.Fatalf("repairFilesystem: %v", err)
+	}
+}
+
+func TestReplaceCorruptDriveKeepsOriginalWhenFormatFails(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "usb.drive")
+	if err := os.WriteFile(path, []byte("original"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "mkfs.fat"), []byte("#!/bin/sh\nexit 8\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+
+	m := NewManager(path, 1<<20)
+	if err := m.replaceCorruptDrive(); err == nil {
+		t.Fatal("replaceCorruptDrive succeeded")
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "original" {
+		t.Fatalf("original drive changed to %q", got)
 	}
 }
 

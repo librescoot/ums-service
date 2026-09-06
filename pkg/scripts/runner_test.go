@@ -2,6 +2,7 @@ package scripts
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -34,8 +35,12 @@ func TestMDBScriptFailureIsReturnedAndTemporaryFileRemoved(t *testing.T) {
 }
 
 func TestScriptErrorBoundsOutput(t *testing.T) {
-	err := scriptError("test", context.Canceled, []byte(strings.Repeat("x", maxErrorOutput+100)))
-	if len(err.Error()) > maxErrorOutput+100 {
-		t.Fatalf("error is not bounded: %d bytes", len(err.Error()))
+	for _, err := range []error{
+		scriptError("test", context.Canceled, []byte(strings.Repeat("x", maxErrorOutput+100))),
+		scriptError("test", errors.New(strings.Repeat("x", maxErrorOutput+100)), nil),
+	} {
+		if len(err.Error()) > maxErrorOutput+100 {
+			t.Fatalf("error is not bounded: %d bytes", len(err.Error()))
+		}
 	}
 }

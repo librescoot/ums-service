@@ -77,10 +77,14 @@ func (r *Runner) runMDBScript(scriptsDir string) error {
 const maxErrorOutput = 4096
 
 func scriptError(name string, err error, output []byte) error {
-	if len(output) > maxErrorOutput {
-		output = output[len(output)-maxErrorOutput:]
+	detail := err.Error()
+	if len(output) > 0 {
+		detail += ", output: " + strings.TrimSpace(string(output))
 	}
-	return fmt.Errorf("%s failed: %w, output: %s", name, err, strings.TrimSpace(string(output)))
+	if len(detail) > maxErrorOutput {
+		detail = detail[len(detail)-maxErrorOutput:]
+	}
+	return fmt.Errorf("%s failed: %s", name, detail)
 }
 
 func (r *Runner) runDBCScript(ctx context.Context, timeout time.Duration, logger *umslog.Logger, scriptsDir string) error {

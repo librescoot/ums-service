@@ -1,6 +1,7 @@
 package disk
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -159,37 +160,71 @@ func (m *Manager) formatDrive(path string) error {
 	return nil
 }
 
-func (m *Manager) checkFilesystem() error {
-	output, err := exec.Command("fsck.fat", "-n", m.driveFile).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("fsck.fat failed: %v, output: %s", err, string(output))
-	}
-	return nil
+type fsckFailure struct {
+	err      error
+	output   string
+	exitCode int
 }
 
-func fsckRepaired(err error) bool {
+func (e *fsckFailure) Error() string {
+	return fmt.Sprintf("fsck.fat failed: %v, output: %s", e.err, e.output)
+}
+
+func runFSCK(args ...string) error {
+	output, err := exec.Command("fsck.fat", args...).CombinedOutput()
 	if err == nil {
-		return true
+		return nil
 	}
-	exitErr, ok := err.(*exec.ExitError)
-	return ok && exitErr.ExitCode() == 1
+	failure := &fsckFailure{err: err, output: string(output), exitCode: -1}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		failure.exitCode = exitErr.ExitCode()
+	}
+	return failure
+}
+
+func fsckExitCode(err error) int {
+	var failure *fsckFailure
+	if errors.As(err, &failure) {
+		return failure.exitCode
+	}
+	return -1
+}
+
+func hasFilesystemErrors(err error) bool {
+	code := fsckExitCode(err)
+	return code == 1 || code == 4
+}
+
+type unrecoverableFilesystemError struct{ err error }
+
+func (e *unrecoverableFilesystemError) Error() string { return e.err.Error() }
+func (e *unrecoverableFilesystemError) Unwrap() error { return e.err }
+
+func (m *Manager) checkFilesystem() error {
+	return runFSCK("-n", m.driveFile)
 }
 
 func (m *Manager) repairFilesystem() error {
-	output, err := exec.Command("fsck.fat", "-a", m.driveFile).CombinedOutput()
-	if !fsckRepaired(err) {
-		return fmt.Errorf("fsck.fat repair failed: %v, output: %s", err, string(output))
+	if err := runFSCK("-a", m.driveFile); err != nil {
+		switch fsckExitCode(err) {
+		case 1:
+		case 4:
+			return &unrecoverableFilesystemError{err: err}
+		default:
+			return err
+		}
 	}
 	if err := m.checkFilesystem(); err != nil {
-		return fmt.Errorf("filesystem remains inconsistent after repair: %w", err)
+		if hasFilesystemErrors(err) {
+			return &unrecoverableFilesystemError{err: fmt.Errorf("filesystem remains inconsistent after repair: %w", err)}
+		}
+		return fmt.Errorf("filesystem recheck failed after repair: %w", err)
 	}
 	return nil
 }
 
 func (m *Manager) replaceCorruptDrive() error {
-	if err := os.Remove(m.driveFile); err != nil {
-		return fmt.Errorf("remove corrupted drive: %w", err)
-	}
 	if err := m.createAndFormatDrive(); err != nil {
 		return fmt.Errorf("create replacement drive: %w", err)
 	}
@@ -198,8 +233,15 @@ func (m *Manager) replaceCorruptDrive() error {
 
 func (m *Manager) Mount() error {
 	if checkErr := m.checkFilesystem(); checkErr != nil {
+		if !hasFilesystemErrors(checkErr) {
+			return fmt.Errorf("could not check USB filesystem: %w", checkErr)
+		}
 		log.Printf("Filesystem check failed: %v — attempting repair", checkErr)
 		if repairErr := m.repairFilesystem(); repairErr != nil {
+			var unrecoverable *unrecoverableFilesystemError
+			if !errors.As(repairErr, &unrecoverable) {
+				return fmt.Errorf("could not repair USB filesystem: %w", repairErr)
+			}
 			if replaceErr := m.replaceCorruptDrive(); replaceErr != nil {
 				return fmt.Errorf("filesystem is corrupt (%v), repair failed (%v), and replacement failed: %w", checkErr, repairErr, replaceErr)
 			}
