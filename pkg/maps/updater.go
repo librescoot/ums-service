@@ -130,17 +130,23 @@ func (u *Updater) processMBTiles(ctx context.Context, timeout time.Duration, log
 	}
 
 	remotePath := filepath.Join(u.dbcMapsDir, "map.mbtiles")
+	uploadPath := remotePath + ".tmp"
 
 	var progress dbc.ProgressFunc
 	if logger != nil {
 		progress = logger.ProgressCallback("map.mbtiles")
 		defer logger.ClearProgress()
 	}
-	if err := u.dbcInterface.TransferFile(opCtx, localPath, remotePath, progress); err != nil {
+	if err := u.dbcInterface.TransferFile(opCtx, localPath, uploadPath, progress); err != nil {
+		u.cleanupRemote(opCtx, uploadPath)
 		return fmt.Errorf("failed to transfer mbtiles to DBC: %w", err)
 	}
+	if _, err := u.dbcInterface.RunCommand(opCtx, fmt.Sprintf("sync && mv -f %s %s", uploadPath, remotePath)); err != nil {
+		u.cleanupRemote(opCtx, uploadPath)
+		return fmt.Errorf("failed to install mbtiles on DBC: %w", err)
+	}
 
-	log.Printf("Successfully copied mbtiles to DBC at %s", remotePath)
+	log.Printf("Successfully installed mbtiles on DBC at %s", remotePath)
 
 	// Bookkeeping runs on the parent context, not opCtx: the transfer may have
 	// used most of the per-file budget, and recording what landed is worth a
