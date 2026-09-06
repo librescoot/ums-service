@@ -81,10 +81,6 @@ func (u *Updater) ProcessMaps(ctx context.Context, perFileTimeout time.Duration,
 		return fmt.Errorf("failed to read maps directory: %w", err)
 	}
 
-	if !u.dbcInterface.IsEnabled() {
-		return fmt.Errorf("DBC interface not enabled for map updates")
-	}
-
 	var mbtilesFile, tilesFile string
 
 	// Find map files
@@ -101,6 +97,15 @@ func (u *Updater) ProcessMaps(ctx context.Context, perFileTimeout time.Duration,
 		}
 	}
 
+	if mbtilesFile == "" && tilesFile == "" {
+		log.Println("No map files found to process")
+		return nil
+	}
+
+	if !u.dbcInterface.IsEnabled() {
+		return fmt.Errorf("DBC interface not enabled for map updates")
+	}
+
 	if mbtilesFile != "" {
 		if err := u.processMBTiles(ctx, perFileTimeout, logger, mbtilesFile); err != nil {
 			return fmt.Errorf("failed to process mbtiles: %w", err)
@@ -111,10 +116,6 @@ func (u *Updater) ProcessMaps(ctx context.Context, perFileTimeout time.Duration,
 		if err := u.processTilesTar(ctx, perFileTimeout, logger, tilesFile); err != nil {
 			return fmt.Errorf("failed to process tiles.tar: %w", err)
 		}
-	}
-
-	if mbtilesFile == "" && tilesFile == "" {
-		log.Println("No map files found to process")
 	}
 
 	return nil

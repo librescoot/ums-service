@@ -1,6 +1,12 @@
 package maps
 
-import "testing"
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+)
 
 func TestIsValhallaTilesArchive(t *testing.T) {
 	cases := []struct {
@@ -21,6 +27,18 @@ func TestIsValhallaTilesArchive(t *testing.T) {
 		if got := IsValhallaTilesArchive(c.name); got != c.want {
 			t.Errorf("IsValhallaTilesArchive(%q) = %v, want %v", c.name, got, c.want)
 		}
+	}
+}
+
+func TestProcessMapsEmptyDirectoryDoesNotRequireDBC(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "maps"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	updater := New(nil, nil)
+	if err := updater.ProcessMaps(context.Background(), time.Second, nil, root); err != nil {
+		t.Fatalf("ProcessMaps() = %v, want successful no-op", err)
 	}
 }
 
