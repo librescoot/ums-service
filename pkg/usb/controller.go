@@ -3,6 +3,7 @@ package usb
 import (
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/exec"
 	"strings"
@@ -25,6 +26,7 @@ type Controller struct {
 	monitorRunning  bool
 	detachCh        chan struct{}
 	monitorInterval time.Duration
+	normalLinkWasUp bool
 }
 
 func NewController(driveFile string) *Controller {
@@ -66,6 +68,7 @@ func (c *Controller) SwitchMode(mode string) error {
 }
 
 func (c *Controller) switchToUMS() error {
+	c.normalLinkWasUp = interfaceIsUp("usb0")
 	if err := c.unloadModule("g_ether"); err != nil {
 		log.Printf("Warning: failed to unload g_ether: %v", err)
 	}
@@ -91,12 +94,19 @@ func (c *Controller) switchToNormal() error {
 	if err := c.loadModule("g_ether"); err != nil {
 		return fmt.Errorf("failed to load g_ether: %w", err)
 	}
-	if err := enableInterface("usb0"); err != nil {
-		return fmt.Errorf("failed to enable USB network interface: %w", err)
+	if c.normalLinkWasUp {
+		if err := enableInterface("usb0"); err != nil {
+			return fmt.Errorf("failed to restore USB network interface: %w", err)
+		}
 	}
 
 	log.Println("Switched to normal mode")
 	return nil
+}
+
+func interfaceIsUp(name string) bool {
+	iface, err := net.InterfaceByName(name)
+	return err == nil && iface.Flags&net.FlagUp != 0
 }
 
 func enableInterface(name string) error {

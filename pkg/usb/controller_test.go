@@ -7,6 +7,15 @@ import (
 	"testing"
 )
 
+func TestInterfaceIsUp(t *testing.T) {
+	if !interfaceIsUp("lo0") && !interfaceIsUp("lo") {
+		t.Fatal("loopback interface should be up")
+	}
+	if interfaceIsUp("interface-that-does-not-exist") {
+		t.Fatal("missing interface reported up")
+	}
+}
+
 func TestEnableInterfaceBringsLinkUp(t *testing.T) {
 	dir := t.TempDir()
 	argsPath := filepath.Join(dir, "args")
