@@ -221,6 +221,10 @@ func (s *Service) handleModeChange(mode string) error {
 	case "normal":
 		return s.switchToNormal(prevMode)
 	default:
+		s.setResult(resultError, "rejected unsupported USB mode %q; remaining in %s", mode, prevMode)
+		if err := s.publisher.Set("mode", prevMode, ipc.Sync()); err != nil {
+			return fmt.Errorf("unknown mode %q and failed to restore mode %q: %w", mode, prevMode, err)
+		}
 		return fmt.Errorf("unknown mode: %s", mode)
 	}
 }
