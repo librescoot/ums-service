@@ -202,7 +202,37 @@ func (e *unrecoverableFilesystemError) Error() string { return e.err.Error() }
 func (e *unrecoverableFilesystemError) Unwrap() error { return e.err }
 
 func (m *Manager) checkFilesystem() error {
-	return runFSCK("-n", m.driveFile)
+	err := runFSCK("-n", m.driveFile)
+	if fsckExitCode(err) != 8 {
+		return err
+	}
+	valid, probeErr := hasValidFATBootSector(m.driveFile)
+	if probeErr != nil {
+		return fmt.Errorf("probe FAT boot sector: %w", probeErr)
+	}
+	if !valid {
+		return &unrecoverableFilesystemError{err: err}
+	}
+	return err
+}
+
+func hasValidFATBootSector(path string) (bool, error) {
+	sector := make([]byte, 512)
+	f, err := os.Open(path)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	if _, err := f.Read(sector); err != nil {
+		return false, err
+	}
+	bytesPerSector := int(sector[11]) | int(sector[12])<<8
+	sectorsPerCluster := sector[13]
+	reservedSectors := int(sector[14]) | int(sector[15])<<8
+	fatCount := sector[16]
+	validSectorSize := bytesPerSector == 512 || bytesPerSector == 1024 || bytesPerSector == 2048 || bytesPerSector == 4096
+	validClusterSize := sectorsPerCluster != 0 && sectorsPerCluster&(sectorsPerCluster-1) == 0
+	return validSectorSize && validClusterSize && reservedSectors != 0 && (fatCount == 1 || fatCount == 2) && sector[510] == 0x55 && sector[511] == 0xaa, nil
 }
 
 func (m *Manager) repairFilesystem() error {
@@ -233,6 +263,13 @@ func (m *Manager) replaceCorruptDrive() error {
 
 func (m *Manager) Mount() error {
 	if checkErr := m.checkFilesystem(); checkErr != nil {
+		var unrecoverable *unrecoverableFilesystemError
+		if errors.As(checkErr, &unrecoverable) {
+			if replaceErr := m.replaceCorruptDrive(); replaceErr != nil {
+				return fmt.Errorf("filesystem is corrupt (%v) and replacement failed: %w", checkErr, replaceErr)
+			}
+			return fmt.Errorf("filesystem was unrecoverable and was replaced; reconnect the USB drive, copy the files again, and retry: %v", checkErr)
+		}
 		if !hasFilesystemErrors(checkErr) {
 			return fmt.Errorf("could not check USB filesystem: %w", checkErr)
 		}
