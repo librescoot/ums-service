@@ -66,6 +66,31 @@ func TestVolumeLabelFitsFAT(t *testing.T) {
 	}
 }
 
+func TestFATBootSectorValidation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "drive")
+	sector := make([]byte, 512)
+	sector[11], sector[12] = 0, 2
+	sector[13] = 8
+	sector[14] = 32
+	sector[16] = 2
+	sector[510], sector[511] = 0x55, 0xaa
+	if err := os.WriteFile(path, sector, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	valid, err := hasValidFATBootSector(path)
+	if err != nil || !valid {
+		t.Fatalf("valid FAT boot sector: valid=%v err=%v", valid, err)
+	}
+	sector[11], sector[12] = 0, 0
+	if err := os.WriteFile(path, sector, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	valid, err = hasValidFATBootSector(path)
+	if err != nil || valid {
+		t.Fatalf("invalid FAT boot sector: valid=%v err=%v", valid, err)
+	}
+}
+
 func TestFilesystemErrorExitStatuses(t *testing.T) {
 	for _, code := range []int{1, 4} {
 		err := &fsckFailure{err: exec.Command("sh", "-c", "exit 1").Run(), exitCode: code}
