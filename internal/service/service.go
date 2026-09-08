@@ -35,7 +35,10 @@ import (
 
 const logBundleKeepCount = 10
 
-const installAwaitTimeout = 10 * time.Minute
+const (
+	installAwaitTimeout = 10 * time.Minute
+	mdbRebootOwnerPath  = "/run/librescoot/ums-mdb-reboot-owner"
+)
 
 var rebootAllowedVehicleStates = map[string]bool{
 	"stand-by":      true,
@@ -153,6 +156,21 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 
 	s.runStartupCleanup()
+	// Clear a claim orphaned by a prior process only when no install remains
+	// active. Pending/installing state keeps the fail-safe ownership in place.
+	if ota, err := s.client.HGetAll("ota"); err == nil {
+		mdb := ota["status:mdb"]
+		dbc := ota["status:dbc"]
+		if (mdb == "" || mdb == "idle" || mdb == "error") &&
+			(dbc == "" || dbc == "idle" || dbc == "error") {
+			if err := s.client.HSet("ota", "reboot-owner:mdb", ""); err != nil {
+				log.Printf("Failed to clear orphaned MDB reboot ownership: %v", err)
+			}
+			if err := os.Remove(mdbRebootOwnerPath); err != nil && !os.IsNotExist(err) {
+				log.Printf("Failed to clear orphaned MDB reboot owner file: %v", err)
+			}
+		}
+	}
 
 	s.usbCtrl.StartMonitoring()
 
@@ -545,6 +563,61 @@ func (s *Service) awaitInstallsAndReboot(ctx context.Context, queued update.Queu
 	}
 	defer source.Stop()
 
+	// update-service normally owns MDB reboot scheduling. Claim it before
+	// publishing install requests so combined imports cannot reboot the MDB
+	// while the DBC is still rebooting, verifying, or committing. The claim is
+	// scoped to this awaiter and is cleared on every exit.
+	releaseRebootOwner := false
+	if queued.MDB {
+		if err := os.MkdirAll(filepath.Dir(mdbRebootOwnerPath), 0o755); err != nil {
+			s.setResult(resultError, "could not create MDB reboot owner directory: %v", err)
+			return
+		}
+		if err := os.WriteFile(mdbRebootOwnerPath, []byte("ums\n"), 0o644); err != nil {
+			s.setResult(resultError, "could not persist MDB reboot ownership: %v", err)
+			return
+		}
+		if err := s.client.HSet("ota", "reboot-owner:mdb", "ums"); err != nil {
+			_ = os.Remove(mdbRebootOwnerPath)
+			s.setResult(resultError, "could not claim MDB reboot ownership: %v", err)
+			return
+		}
+		ownerDone := make(chan struct{})
+		ownerStopped := make(chan struct{})
+		// Redis is volatile. Renew the claim while installs are being watched so
+		// a flush cannot hand MDB reboot ownership back to update-service in the
+		// middle of a combined DBC activation.
+		go func() {
+			defer close(ownerStopped)
+			ticker := time.NewTicker(2 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ownerDone:
+					return
+				case <-ticker.C:
+					if err := s.client.HSet("ota", "reboot-owner:mdb", "ums"); err != nil {
+						log.Printf("awaiter: failed to renew MDB reboot ownership: %v", err)
+					}
+				}
+			}
+		}()
+		defer func() {
+			close(ownerDone)
+			<-ownerStopped
+			if !releaseRebootOwner {
+				return
+			}
+			if err := s.client.HSet("ota", "reboot-owner:mdb", ""); err != nil {
+				log.Printf("awaiter: failed to clear MDB reboot ownership: %v", err)
+				return
+			}
+			if err := os.Remove(mdbRebootOwnerPath); err != nil && !os.IsNotExist(err) {
+				log.Printf("awaiter: failed to clear MDB reboot owner file: %v", err)
+			}
+		}()
+	}
+
 	for _, p := range queued.PendingPushes {
 		if _, perr := s.client.LPush(p.Channel, p.Value); perr != nil {
 			logger.Error("reboot", "LPush %s failed: %v", p.Channel, perr)
@@ -576,6 +649,17 @@ func (s *Service) awaitInstallsAndReboot(ctx context.Context, queued update.Queu
 		return
 	}
 
+	// All queued installers are now terminal. It is safe to release MDB reboot
+	// ownership on any subsequent return; timeout/error paths above retain it.
+	releaseRebootOwner = true
+
+	if queued.DBC && !queued.MDB {
+		s.setResult(resultRebootTriggered, "DBC reboot completed")
+		logger.Logf("reboot", "DBC reboot completed by update-service")
+		log.Println("awaiter: DBC reboot completed by update-service")
+		return
+	}
+
 	s.setStep("waiting-vehicle-state")
 
 	state, err := s.client.HGet("vehicle", "state")
@@ -601,31 +685,15 @@ func (s *Service) awaitInstallsAndReboot(ctx context.Context, queued update.Queu
 	// command is consumed. This runs only in the background awaiter.
 	time.Sleep(500 * time.Millisecond)
 
-	if queued.MDB {
-		if _, err := s.client.LPush("scooter:power", "reboot"); err != nil {
-			logger.Error("reboot", "LPush scooter:power reboot failed: %v", err)
-			log.Printf("awaiter: failed to trigger MDB reboot: %v", err)
-			s.setResult(resultError, "could not trigger the MDB reboot: %v", err)
-			return
-		}
-		s.setResult(resultRebootTriggered, "MDB reboot triggered")
-		logger.Logf("reboot", "MDB reboot triggered")
-		log.Println("awaiter: MDB reboot triggered")
+	if _, err := s.client.LPush("scooter:power", "reboot"); err != nil {
+		logger.Error("reboot", "LPush scooter:power reboot failed: %v", err)
+		log.Printf("awaiter: failed to trigger MDB reboot: %v", err)
+		s.setResult(resultError, "could not trigger the MDB reboot: %v", err)
 		return
 	}
-
-	// DBC-only: power-cycle the dashboard.
-	for _, cmd := range []string{"dashboard:off", "dashboard:on"} {
-		if _, err := s.client.LPush("scooter:hardware", cmd); err != nil {
-			logger.Error("reboot", "LPush scooter:hardware %s failed: %v", cmd, err)
-			log.Printf("awaiter: failed to send %s: %v", cmd, err)
-			s.setResult(resultError, "could not power-cycle the DBC: %v", err)
-			return
-		}
-	}
-	s.setResult(resultRebootTriggered, "DBC power cycle triggered")
-	logger.Logf("reboot", "DBC power cycle triggered")
-	log.Println("awaiter: DBC power cycle triggered")
+	s.setResult(resultRebootTriggered, "MDB reboot triggered")
+	logger.Logf("reboot", "MDB reboot triggered")
+	log.Println("awaiter: MDB reboot triggered")
 }
 
 func (s *Service) checkIfDBCNeeded(mountPoint string) bool {

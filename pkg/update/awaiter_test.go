@@ -62,7 +62,7 @@ func TestWaitForCompletion_MDBOnly_HappyPath(t *testing.T) {
 	}
 }
 
-func TestWaitForCompletion_DBCOnly_HappyPath(t *testing.T) {
+func TestWaitForCompletion_DBCOnly_WaitsForPostRebootIdle(t *testing.T) {
 	src := newFakeOTASource(map[string]string{"dbc": "idle"})
 	q := Queued{DBC: true}
 
@@ -76,11 +76,45 @@ func TestWaitForCompletion_DBCOnly_HappyPath(t *testing.T) {
 
 	select {
 	case err := <-done:
+		t.Fatalf("returned before the post-reboot outcome: err=%v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	src.push("dbc", "idle")
+
+	select {
+	case err := <-done:
 		if err != nil {
 			t.Fatalf("expected nil, got %v", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for awaiter to return")
+		t.Fatal("timed out waiting for post-reboot idle")
+	}
+}
+
+func TestWaitForCompletion_DBCOnly_PostRebootError(t *testing.T) {
+	src := newFakeOTASource(map[string]string{"dbc": "idle"})
+	q := Queued{DBC: true}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- WaitForCompletion(context.Background(), src, q, 2*time.Second, nil)
+	}()
+
+	src.push("dbc", "installing")
+	src.push("dbc", "pending-reboot")
+	src.push("dbc", "error")
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if !strings.Contains(err.Error(), "dbc") || !strings.Contains(err.Error(), "error") {
+			t.Errorf("expected error to mention dbc and error, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for post-reboot error")
 	}
 }
 
@@ -108,11 +142,47 @@ func TestWaitForCompletion_Both_BothMustComplete(t *testing.T) {
 
 	select {
 	case err := <-done:
+		t.Fatalf("returned before DBC verified commit: err=%v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	src.push("dbc", "idle")
+	select {
+	case err := <-done:
 		if err != nil {
 			t.Fatalf("expected nil, got %v", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for awaiter to return after both complete")
+		t.Fatal("timed out waiting for DBC final idle")
+	}
+}
+
+func TestWaitForCompletion_Both_DBCFinalDoesNotFinishMDB(t *testing.T) {
+	src := newFakeOTASource(map[string]string{"mdb": "idle", "dbc": "idle"})
+	q := Queued{MDB: true, DBC: true}
+	done := make(chan error, 1)
+	go func() {
+		done <- WaitForCompletion(context.Background(), src, q, 2*time.Second, nil)
+	}()
+
+	src.push("dbc", "installing")
+	src.push("dbc", "pending-reboot")
+	src.push("dbc", "idle")
+	select {
+	case err := <-done:
+		t.Fatalf("returned while MDB was unfinished: err=%v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	src.push("mdb", "installing")
+	src.push("mdb", "pending-reboot")
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out after both components finished")
 	}
 }
 
@@ -292,6 +362,7 @@ func TestWaitForCompletion_OnPendingNarrowsAsComponentsFinish(t *testing.T) {
 	src.push("mdb", "pending-reboot")
 	src.push("dbc", "installing")
 	src.push("dbc", "pending-reboot")
+	src.push("dbc", "idle")
 
 	select {
 	case err := <-done:

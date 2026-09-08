@@ -9,6 +9,7 @@ import (
 
 // Component status values mirror update-service/internal/status.
 const (
+	statusIdle          = "idle"
 	statusPendingReboot = "pending-reboot"
 	statusError         = "error"
 )
@@ -42,13 +43,21 @@ type awaiterState struct {
 	// status leave pending-reboot (downloading/installing/error)
 	// before counting a subsequent pending-reboot as ours.
 	sawNonPendingReboot bool
-	// done becomes true when pending-reboot is observed after
-	// sawNonPendingReboot is true.
+	// sawPendingReboot is used by DBC installs, which remain unfinished
+	// until update-service reboots the DBC and reports its final idle or
+	// error status, including when an MDB update is queued alongside it.
+	sawPendingReboot bool
+	// done becomes true at pending-reboot for MDB-driven installs, or
+	// at the final idle status for a DBC-only install.
 	done bool
 }
 
 // WaitForCompletion blocks until every component in q with its bool set
-// has transitioned to pending-reboot since the function was entered.
+// has completed the relevant install lifecycle. MDB installs complete at
+// pending-reboot so the caller can trigger the MDB reboot. DBC installs
+// complete only when update-service reports idle after its local reboot and
+// verified commit; this also applies to combined MDB+DBC installs. A
+// post-pending-reboot error fails the wait.
 //
 // onPending receives the sorted, non-empty set of unfinished components.
 //
@@ -61,6 +70,7 @@ func WaitForCompletion(ctx context.Context, source OTAStatusSource, q Queued, ti
 		return nil
 	}
 
+	waitForDBCFinal := q.DBC
 	states := make(map[string]*awaiterState, len(required))
 	for _, c := range required {
 		st := &awaiterState{}
@@ -103,6 +113,10 @@ func WaitForCompletion(ctx context.Context, source OTAStatusSource, q Queued, ti
 			switch u.Status {
 			case statusPendingReboot:
 				if st.sawNonPendingReboot && !st.done {
+					if waitForDBCFinal && u.Component == "dbc" {
+						st.sawPendingReboot = true
+						continue
+					}
 					st.done = true
 					if allDone(states) {
 						return nil
@@ -116,6 +130,15 @@ func WaitForCompletion(ctx context.Context, source OTAStatusSource, q Queued, ti
 				// Pre-existing error before we saw any install
 				// activity — treat as starting state, like idle.
 				st.sawNonPendingReboot = true
+			case statusIdle:
+				st.sawNonPendingReboot = true
+				if waitForDBCFinal && u.Component == "dbc" && st.sawPendingReboot {
+					st.done = true
+					if allDone(states) {
+						return nil
+					}
+					notify()
+				}
 			default:
 				st.sawNonPendingReboot = true
 			}
