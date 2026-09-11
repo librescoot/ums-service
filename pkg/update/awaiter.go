@@ -52,6 +52,35 @@ type awaiterState struct {
 	done bool
 }
 
+// installInProgress reports whether any of the given components is
+// currently showing a status that means an install is genuinely still
+// running: downloading, preparing, or installing. A DBC at
+// pending-reboot is also mid-flight: update-service reboots it locally
+// and the component only reaches its final state after the post-reboot
+// verification and commit. An MDB at pending-reboot is not treated as
+// active — for MDB that status is the completion signal, so observing
+// it at window expiry means the install never started this cycle (a
+// stale leftover), not that it is running. A read error counts as
+// not-in-progress so the awaiter fails closed into its old
+// retain-the-claim timeout path.
+func installInProgress(source OTAStatusSource, components []string) bool {
+	for _, c := range components {
+		st, err := source.Current(c)
+		if err != nil || st == "" {
+			continue
+		}
+		switch st {
+		case "downloading", "preparing", "installing":
+			return true
+		case statusPendingReboot:
+			if c == "dbc" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // WaitForCompletion blocks until every component in q with its bool set
 // has completed the relevant install lifecycle. MDB installs complete at
 // pending-reboot so the caller can trigger the MDB reboot. DBC installs
@@ -59,12 +88,22 @@ type awaiterState struct {
 // verified commit; this also applies to combined MDB+DBC installs. A
 // post-pending-reboot error fails the wait.
 //
+// windowTimeout is a liveness window, not a total budget: when it
+// expires while a watched component still shows genuine install
+// activity (see installInProgress), the window resets and the wait
+// continues, so a slow delta install is not abandoned mid-flight. The
+// wait gives up for good once overallCap has elapsed, or as soon as a
+// window expires with no watched component actively installing (the
+// install never started or is stuck). On give-up the caller retains
+// whatever ownership claims it holds, preserving the existing
+// fail-safe semantics.
+//
 // onPending receives the sorted, non-empty set of unfinished components.
 //
 // Returns nil on success, an error wrapping context.DeadlineExceeded on
-// timeout, an error wrapping context.Canceled on ctx cancellation, or an
-// error naming the component that went to error status.
-func WaitForCompletion(ctx context.Context, source OTAStatusSource, q Queued, timeout time.Duration, onPending func([]string)) error {
+// final timeout, an error wrapping context.Canceled on ctx cancellation,
+// or an error naming the component that went to error status.
+func WaitForCompletion(ctx context.Context, source OTAStatusSource, q Queued, windowTimeout, overallCap time.Duration, onPending func([]string)) error {
 	required := RequiredComponents(q)
 	if len(required) == 0 {
 		return nil
@@ -94,14 +133,30 @@ func WaitForCompletion(ctx context.Context, source OTAStatusSource, q Queued, ti
 	}
 	notify()
 
-	waitCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
+	window := time.NewTimer(windowTimeout)
+	defer window.Stop()
+	// overallCap bounds the total wait across all extensions. Zero or
+	// negative disables the cap; production always passes a positive
+	// cap so a hung install cannot hold the reboot-ownership claim
+	// forever.
+	var overall time.Time
+	if overallCap > 0 {
+		overall = time.Now().Add(overallCap)
+	}
 
 	updates := source.Changes()
 	for {
 		select {
-		case <-waitCtx.Done():
-			return fmt.Errorf("waiting for install completion: %w", waitCtx.Err())
+		case <-ctx.Done():
+			return fmt.Errorf("waiting for install completion: %w", ctx.Err())
+		case <-window.C:
+			if !overall.IsZero() && !time.Now().Before(overall) {
+				return fmt.Errorf("waiting for install completion: %w", context.DeadlineExceeded)
+			}
+			if !installInProgress(source, required) {
+				return fmt.Errorf("waiting for install completion: %w", context.DeadlineExceeded)
+			}
+			window.Reset(windowTimeout)
 		case u, ok := <-updates:
 			if !ok {
 				return fmt.Errorf("ota status source closed before completion")

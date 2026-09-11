@@ -36,8 +36,19 @@ import (
 const logBundleKeepCount = 10
 
 const (
+	// installAwaitTimeout is the per-window liveness timeout for the
+	// install awaiter. The window resets whenever an install is
+	// genuinely still progressing (see update.WaitForCompletion), so a
+	// slow install is not abandoned mid-flight; only a window that
+	// expires with no install activity ends the wait early.
 	installAwaitTimeout = 10 * time.Minute
-	mdbRebootOwnerPath  = "/run/librescoot/ums-mdb-reboot-owner"
+	// installOverallCap bounds the total time the awaiter keeps the
+	// MDB reboot-ownership claim while waiting. On final expiry the
+	// claim is intentionally retained as a fail-safe (as before), but
+	// the cap must be generous enough to cover slow delta installs
+	// (observed ~12 min on the bench for 063513) with large margin.
+	installOverallCap  = 2 * time.Hour
+	mdbRebootOwnerPath = "/run/librescoot/ums-mdb-reboot-owner"
 )
 
 var rebootAllowedVehicleStates = map[string]bool{
@@ -634,7 +645,7 @@ func (s *Service) awaitInstallsAndReboot(ctx context.Context, queued update.Queu
 		s.setStep("waiting-" + strings.Join(components, "+"))
 	}
 
-	if err := update.WaitForCompletion(ctx, source, queued, installAwaitTimeout, onPending); err != nil {
+	if err := update.WaitForCompletion(ctx, source, queued, installAwaitTimeout, installOverallCap, onPending); err != nil {
 		logger.Error("reboot", "skip: %v", err)
 		log.Printf("awaiter: skip reboot: %v", err)
 		switch {
@@ -642,7 +653,7 @@ func (s *Service) awaitInstallsAndReboot(ctx context.Context, queued update.Queu
 			// A new UMS entry clears the superseded result.
 		case errors.Is(err, context.DeadlineExceeded):
 			s.setResult(resultTimeout, "install did not finish within %s (still waiting on %s)",
-				installAwaitTimeout, strings.Join(pending, ", "))
+				installOverallCap, strings.Join(pending, ", "))
 		default:
 			s.setResult(resultInstallError, "%v", err)
 		}
