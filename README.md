@@ -8,7 +8,7 @@ The UMS Service provides the vehicle's USB gadget workflow. It switches the MDB 
 - Switches between `g_ether` (normal) and `g_mass_storage` (UMS) USB gadget modules.
 - Creates and manages a 1 GiB FAT-backed virtual drive at `/data/usb.drive` by default.
 - Exports and imports settings, WireGuard configuration, selected service configuration, and an optional boot script.
-- Queues MDB and DBC Mender update artifacts, transfers DBC-bound content through the DBC interface, and waits for queued installation status before a permitted reboot.
+- Queues full (`.mender`) and delta (`.delta`) MDB and DBC update artifacts, transfers DBC-bound content through the DBC interface, and waits for queued installation status before a permitted reboot.
 - Imports supported map archives and MDB/DBC scripts.
 - Collects diagnostics and exposes saved log bundles on the virtual drive.
 - Tracks USB attach/detach state, supports the two-detach `ums-by-dbc` flow, and updates the `usb` Redis/Valkey hash with mode, status, and processing step.
@@ -76,7 +76,7 @@ Runtime operation requires:
 - `modprobe` and `rmmod` for gadget switching;
 - filesystem and mount tooling sufficient to create, format, mount, and unmount the virtual drive;
 - writable `/data` storage; and
-- the configured DBC interface for DBC updates, maps, or scripts.
+- the configured DBC interface for DBC updates, maps, or scripts; it uses SSH for reachability and remote commands, prefers HTTP PUT for file transfer, and falls back to SCP.
 
 ```sh
 systemctl status librescoot-ums.service

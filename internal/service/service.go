@@ -700,7 +700,7 @@ func (s *Service) checkIfDBCNeeded(mountPoint string) bool {
 	updateDir := filepath.Join(mountPoint, "system-update")
 	if entries, err := os.ReadDir(updateDir); err == nil {
 		for _, entry := range entries {
-			if !entry.IsDir() && strings.HasPrefix(entry.Name(), "librescoot-") && strings.Contains(entry.Name(), "-dbc") && strings.HasSuffix(entry.Name(), ".mender") {
+			if !entry.IsDir() && update.IsDBCUpdateArtifact(entry.Name()) {
 				log.Println("Found DBC update files, DBC needed")
 				return true
 			}

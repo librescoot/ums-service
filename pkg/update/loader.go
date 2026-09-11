@@ -191,6 +191,25 @@ func isUpdateFile(name string) bool {
 	return strings.HasSuffix(name, ".mender") || strings.HasSuffix(name, ".delta")
 }
 
+func updateArtifactTarget(name string) string {
+	if !strings.HasPrefix(name, "librescoot-") || !isUpdateFile(name) {
+		return ""
+	}
+	if strings.Contains(name, "-mdb") {
+		return "mdb"
+	}
+	if strings.Contains(name, "-dbc") {
+		return "dbc"
+	}
+	return ""
+}
+
+// IsDBCUpdateArtifact reports whether name is a supported DBC update artifact.
+// Exported so DBC preflight and update processing use the same filename rules.
+func IsDBCUpdateArtifact(name string) bool {
+	return updateArtifactTarget(name) == "dbc"
+}
+
 // splitVersion splits "librescoot-foo-mdb-nightly-20260429T102607.mender" into
 // ("librescoot-foo-mdb-nightly", "20260429T102607"). The version token is the
 // segment after the last '-' (extension stripped).
@@ -281,20 +300,17 @@ func (l *Loader) ProcessUpdates(ctx context.Context, perFileTimeout time.Duratio
 		}
 
 		filename := entry.Name()
-		if !strings.HasPrefix(filename, "librescoot-") || (!strings.HasSuffix(filename, ".mender") && !strings.HasSuffix(filename, ".delta")) {
-			continue
-		}
-
 		srcPath := filepath.Join(updateDir, filename)
 
-		if strings.Contains(filename, "-mdb") {
+		switch updateArtifactTarget(filename) {
+		case "mdb":
 			push, err := l.processMDBUpdate(logger, srcPath)
 			if err != nil {
 				return queued, fmt.Errorf("failed to process MDB update: %w", err)
 			}
 			queued.MDB = true
 			queued.PendingPushes = append(queued.PendingPushes, push)
-		} else if strings.Contains(filename, "-dbc") {
+		case "dbc":
 			push, err := l.processDBCUpdate(ctx, perFileTimeout, logger, srcPath)
 			if err != nil {
 				return queued, fmt.Errorf("failed to process DBC update: %w", err)
