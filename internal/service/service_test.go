@@ -1,14 +1,139 @@
 package service
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	ipc "github.com/librescoot/redis-ipc"
 	"github.com/librescoot/ums-service/pkg/update"
 )
+
+type testPublisher struct {
+	setMany chan map[string]any
+}
+
+func (p *testPublisher) Set(string, any, ...ipc.SetOption) error {
+	return nil
+}
+
+func (p *testPublisher) SetMany(fields map[string]any, _ ...ipc.SetOption) error {
+	copy := make(map[string]any, len(fields))
+	for key, value := range fields {
+		copy[key] = value
+	}
+	p.setMany <- copy
+	return nil
+}
+
+func TestRequestModeCancelsAndSupersedesInFlightPrep(t *testing.T) {
+	serviceCtx, stopService := context.WithCancel(context.Background())
+	stopService()
+	prepCtx, cancelPrep := context.WithCancel(context.Background())
+	prep := &operation{target: "ums", ctx: prepCtx, cancel: cancelPrep, done: make(chan struct{})}
+	service := &Service{serviceCtx: serviceCtx, currentOp: prep}
+
+	returned := make(chan struct{})
+	go func() {
+		service.requestMode("ums-by-dbc")
+		close(returned)
+	}()
+
+	select {
+	case <-prepCtx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("replacement request did not cancel the in-flight prep")
+	}
+	select {
+	case <-returned:
+		t.Fatal("replacement request did not wait for prep teardown")
+	default:
+	}
+
+	close(prep.done)
+	select {
+	case <-returned:
+	case <-time.After(time.Second):
+		t.Fatal("replacement request did not install the superseding operation")
+	}
+
+	service.mu.Lock()
+	current := service.currentOp
+	service.mu.Unlock()
+	if current == prep || current.target != "ums-by-dbc" {
+		t.Fatalf("current operation = %#v, want superseding ums-by-dbc operation", current)
+	}
+	select {
+	case <-current.done:
+	case <-time.After(time.Second):
+		t.Fatal("superseding operation did not finish")
+	}
+}
+
+func TestRequestModeLeavesStableStateAlone(t *testing.T) {
+	done := make(chan struct{})
+	close(done)
+	cancelled := false
+	stable := &operation{
+		target: "normal",
+		ctx:    context.Background(),
+		cancel: func() { cancelled = true },
+		done:   done,
+	}
+	service := &Service{serviceCtx: context.Background(), currentOp: stable}
+
+	service.requestMode("normal")
+
+	if cancelled {
+		t.Fatal("stable operation was cancelled")
+	}
+	service.mu.Lock()
+	current := service.currentOp
+	service.mu.Unlock()
+	if current != stable {
+		t.Fatal("stable operation was replaced")
+	}
+}
+
+func TestRequestModeCancellationPublishesIdle(t *testing.T) {
+	serviceCtx, stopService := context.WithCancel(context.Background())
+	stopService()
+	prepCtx, cancelPrep := context.WithCancel(context.Background())
+	prep := &operation{target: "ums", ctx: prepCtx, cancel: cancelPrep, done: make(chan struct{})}
+	publisher := &testPublisher{setMany: make(chan map[string]any, 1)}
+	service := &Service{serviceCtx: serviceCtx, currentOp: prep, publisher: publisher}
+
+	returned := make(chan struct{})
+	go func() {
+		service.requestMode("normal")
+		close(returned)
+	}()
+
+	select {
+	case fields := <-publisher.setMany:
+		if fields["status"] != "idle" || fields["step"] != "" || len(fields) != 2 {
+			t.Fatalf("idle publication = %#v, want only status=idle and step=empty", fields)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cancelling prep did not publish idle")
+	}
+	select {
+	case <-returned:
+		t.Fatal("normal request returned before the prep tore down")
+	default:
+	}
+
+	close(prep.done)
+	select {
+	case <-returned:
+	case <-time.After(time.Second):
+		t.Fatal("normal request did not complete after teardown")
+	}
+}
 
 // TestDecideRebootOwnerAction covers the startup reconciliation of a
 // stale MDB reboot-owner claim. The adopted case is the bench deadlock:

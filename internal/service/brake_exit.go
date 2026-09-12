@@ -16,26 +16,18 @@ func (s *Service) startBrakeExitListener() error {
 			return nil
 		}
 
-		// Flag first: switchToUMS holds mu for the whole preparing phase,
-		// so the Lock below parks us until entry has finished. Recording
-		// the hold beforehand lets switchToUMS see it and abandon entry.
-		s.cancelPending.Store(true)
-
 		s.mu.Lock()
-		currentMode := s.usbCtrl.GetCurrentMode()
+		current := s.currentOp
+		active := current != nil && isUMSTarget(current.target)
 		s.mu.Unlock()
-
-		// Entry we just cancelled never reached UMS, so there is nothing
-		// to switch back; switchToUMS already returned things to idle.
-		if currentMode != "ums" {
+		if !active {
 			return nil
 		}
 
+		// The operation target covers preparation as well as an active
+		// gadget, so a brake hold cancels an entry before UMS is attached.
 		log.Println("Left brake hold detected, exiting UMS mode")
-
-		s.mu.Lock()
 		s.doSwitchToNormal()
-		s.mu.Unlock()
 
 		return nil
 	})

@@ -13,7 +13,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	ipc "github.com/librescoot/redis-ipc"
@@ -58,11 +57,25 @@ var rebootAllowedVehicleStates = map[string]bool{
 	"shutting-down": true,
 }
 
+// operation is a single mode transition. A stable state is represented by an
+// operation whose done channel is already closed.
+type operation struct {
+	target string
+	ctx    context.Context
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+
+type hashPublisher interface {
+	Set(string, any, ...ipc.SetOption) error
+	SetMany(map[string]any, ...ipc.SetOption) error
+}
+
 type Service struct {
 	config        *config.Config
 	client        *ipc.Client
 	watcher       *ipc.HashWatcher
-	publisher     *ipc.HashPublisher
+	publisher     hashPublisher
 	usbCtrl       *usb.Controller
 	diskMgr       *disk.Manager
 	dbcInterface  *dbc.Interface
@@ -76,15 +89,12 @@ type Service struct {
 	radioGagaMgr  *radiogaga.Manager
 	uplinkMgr     *uplink.Manager
 	onbootMgr     *onboot.Manager
-	mu            sync.Mutex
+	dispatchMu    sync.Mutex // serializes mode requests through teardown
+	mu            sync.Mutex // protects currentOp, detach state, and reboot state
+	currentOp     *operation
 	detachCount   int
 	umsModeType   string
-	// cancelPending is set by the brake exit listener without taking mu,
-	// which switchToUMS holds for the whole preparing phase. It lets a
-	// left brake hold during preparing abandon the entry before the USB
-	// gadget is ever switched. Cleared at the start of every entry.
-	cancelPending atomic.Bool
-	serviceCtx    context.Context    // set in Run; parent for reboot goroutine
+	serviceCtx    context.Context    // set in Run; parent for operation and reboot goroutines
 	rebootWatcher context.CancelFunc // cancel pending reboot goroutine; nil if none
 	rebootGen     int                // increments per startRebootWatcher; lets a stale goroutine know it's been superseded
 }
@@ -181,6 +191,19 @@ func (s *Service) Run(ctx context.Context) error {
 		s.reconcileRebootOwner(ota)
 	}
 
+	// Give the dispatcher a stable initial state before any monitor can
+	// request a transition.
+	stableDone := make(chan struct{})
+	close(stableDone)
+	s.mu.Lock()
+	s.currentOp = &operation{
+		target: "normal",
+		ctx:    ctx,
+		cancel: func() {},
+		done:   stableDone,
+	}
+	s.mu.Unlock()
+
 	s.usbCtrl.StartMonitoring()
 
 	go s.detachLoop(ctx)
@@ -234,20 +257,13 @@ func (s *Service) detachLoop(ctx context.Context) {
 }
 
 func (s *Service) handleModeChange(mode string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	prevMode := s.usbCtrl.GetCurrentMode()
-	if prevMode == mode {
-		return nil
-	}
-
 	switch mode {
 	case "ums", "ums-by-dbc":
-		return s.switchToUMS(mode, enteringUMSFromNormal(prevMode))
+		return s.switchToUMS(mode, enteringUMSFromNormal(s.usbCtrl.GetCurrentMode()))
 	case "normal":
-		return s.switchToNormal(prevMode)
+		return s.switchToNormal(s.usbCtrl.GetCurrentMode())
 	default:
+		prevMode := s.usbCtrl.GetCurrentMode()
 		s.setResult(resultError, "rejected unsupported USB mode %q; remaining in %s", mode, prevMode)
 		if err := s.publisher.Set("mode", prevMode, ipc.Sync()); err != nil {
 			return fmt.Errorf("unknown mode %q and failed to restore mode %q: %w", mode, prevMode, err)
@@ -264,122 +280,228 @@ func enteringUMSFromNormal(prevMode string) bool {
 	return prevMode != "ums" && prevMode != "ums-by-dbc"
 }
 
-func (s *Service) switchToUMS(mode string, discardStale bool) error {
-	// Only a hold that lands from here on counts as cancelling this entry.
-	s.cancelPending.Store(false)
-	s.setStatus("preparing")
+func isUMSTarget(target string) bool {
+	return target == "ums" || target == "ums-by-dbc"
+}
 
-	if s.rebootWatcher != nil {
-		log.Println("Cancelling pending reboot watcher (re-entering UMS)")
-		s.rebootWatcher()
-		// Don't nil rebootWatcher here — the goroutine's defer
-		// handles cleanup under the generation check. Nilling
-		// here would also be safe but is redundant.
+// opDone reports whether op has completed. Callers hold s.mu.
+func opDone(op *operation) bool {
+	if op == nil {
+		return true
+	}
+	select {
+	case <-op.done:
+		return true
+	default:
+		return false
+	}
+}
+
+// requestMode serializes mode changes. A replacement waits until the previous
+// operation has torn down before its operation is installed and run.
+func (s *Service) requestMode(target string) {
+	s.dispatchMu.Lock()
+	defer s.dispatchMu.Unlock()
+
+	s.mu.Lock()
+	current := s.currentOp
+	currentDone := opDone(current)
+	if current != nil && current.target == target {
+		s.mu.Unlock()
+		return
+	}
+	if current != nil && currentDone && isUMSTarget(current.target) && isUMSTarget(target) {
+		current.target = target
+		s.umsModeType = target
+		s.mu.Unlock()
+		log.Printf("UMS variant changed to %s", target)
+		return
 	}
 
-	if _, err := s.client.Del("usb:log"); err != nil {
-		log.Printf("Warning: failed to clear usb:log: %v", err)
+	var oldDone chan struct{}
+	publishIdle := false
+	if current != nil && !currentDone {
+		current.cancel()
+		oldDone = current.done
+		publishIdle = target == "normal" && isUMSTarget(current.target)
+	}
+	s.mu.Unlock()
+
+	if publishIdle {
+		s.publishIdle()
+	}
+	if oldDone != nil {
+		<-oldDone
 	}
 
-	s.clearResult()
-
-	if err := s.diskMgr.Mount(); err != nil {
-		s.setResult(resultError, "could not prepare the USB drive: %v", err)
-		s.setStatus("idle")
-		return fmt.Errorf("failed to mount drive: %w", err)
+	opCtx, cancel := context.WithCancel(s.serviceCtx)
+	op := &operation{
+		target: target,
+		ctx:    opCtx,
+		cancel: cancel,
+		done:   make(chan struct{}),
 	}
+	s.mu.Lock()
+	s.currentOp = op
+	s.mu.Unlock()
+	go s.runOperation(op)
+}
 
-	mountPoint := s.diskMgr.GetMountPoint()
-
-	if err := s.settingsLdr.CopyToUSB(mountPoint); err != nil {
-		log.Printf("Error copying settings to USB: %v", err)
-	}
-
-	if err := s.updateLdr.PrepareUSB(mountPoint, discardStale, umslog.New(s.client)); err != nil {
-		log.Printf("Error preparing update directory: %v", err)
-	}
-
-	if err := s.mapsUpdater.PrepareUSB(mountPoint); err != nil {
-		log.Printf("Error preparing maps directory: %v", err)
+func (s *Service) runOperation(op *operation) {
+	defer close(op.done)
+	if op.ctx.Err() != nil {
+		return
 	}
 
-	if err := s.wgManager.PrepareUSB(mountPoint); err != nil {
-		log.Printf("Error preparing wireguard directory: %v", err)
-	}
-	if err := s.wgManager.CopyToUSB(mountPoint); err != nil {
-		log.Printf("Error copying wireguard configs to USB: %v", err)
-	}
-
-	if err := s.radioGagaMgr.PrepareUSB(mountPoint); err != nil {
-		log.Printf("Error preparing radio-gaga directory: %v", err)
-	}
-	if err := s.radioGagaMgr.CopyToUSB(mountPoint); err != nil {
-		log.Printf("Error copying radio-gaga config to USB: %v", err)
-	}
-
-	if err := s.uplinkMgr.PrepareUSB(mountPoint); err != nil {
-		log.Printf("Error preparing uplink-service directory: %v", err)
-	}
-	if err := s.uplinkMgr.CopyToUSB(mountPoint); err != nil {
-		log.Printf("Error copying uplink-service config to USB: %v", err)
-	}
-
-	if err := s.onbootMgr.CopyToUSB(mountPoint); err != nil {
-		log.Printf("Error copying onboot.sh to USB: %v", err)
-	}
-
-	if err := s.logBundlesMgr.PrepareUSB(mountPoint); err != nil {
-		log.Printf("Error preparing log-bundles directory: %v", err)
-	}
-	if err := s.logBundlesMgr.CopyToUSB(mountPoint); err != nil {
-		log.Printf("Error copying log bundles to USB: %v", err)
-	}
-
-	s.diagnostics.CollectToUSB(mountPoint)
-
-	if err := s.scriptRunner.PrepareUSB(mountPoint); err != nil {
-		log.Printf("Error preparing scripts directory: %v", err)
-	}
-
-	if err := s.diskMgr.Unmount(); err != nil {
-		s.setStatus("idle")
-		return fmt.Errorf("failed to unmount drive: %w", err)
-	}
-
-	// A left brake hold during preparing abandons the entry here, with the
-	// drive already unmounted and the gadget untouched. Bailing out before
-	// SwitchMode avoids loading g_mass_storage only to unload it again on
-	// the exit path, which would drop the DBC's g_ether link for no reason.
-	if s.cancelPending.Load() {
-		log.Println("UMS entry cancelled by left brake hold during preparing")
-		s.setStep("")
-		s.setStatus("idle")
-		// The gadget never moved, but usb.mode still reads ums from the
-		// request that got us here. Reconcile it the way doSwitchToNormal
-		// does, so the hash keeps matching the controller.
-		if err := s.publisher.Set("mode", "normal", ipc.Sync()); err != nil {
-			log.Printf("Error updating Redis usb mode: %v", err)
+	switch op.target {
+	case "ums", "ums-by-dbc":
+		if err := s.runUMSOp(op); err != nil {
+			log.Printf("Error switching to UMS mode: %v", err)
 		}
-		return nil
+	case "normal":
+		if err := s.runNormalOp(op); err != nil {
+			log.Printf("Error switching to normal mode: %v", err)
+		}
+	default:
+		log.Printf("Unknown mode operation target: %s", op.target)
 	}
+}
 
-	// Publish status BEFORE switching USB — DBC can still read Redis via g_ether
-	s.setStatus("active")
-	s.setLEDs(ledsUMSActive)
-
-	if err := s.usbCtrl.SwitchMode("ums"); err != nil {
-		s.setStatus("idle")
-		s.setLEDs(ledsOff)
-		return fmt.Errorf("failed to switch to UMS mode: %w", err)
-	}
-
-	s.umsModeType = mode
-	s.detachCount = 0
-	log.Printf("Switched to UMS mode (type: %s)", mode)
+// switchToUMS remains the synchronous-call-site wrapper while transitions are
+// dispatched asynchronously. discardStale is recomputed by runUMSOp after any
+// previous operation has finished.
+func (s *Service) switchToUMS(mode string, discardStale bool) error {
+	_ = discardStale
+	s.requestMode(mode)
 	return nil
 }
 
+func (s *Service) runUMSOp(op *operation) error {
+	mounted := false
+	defer func() {
+		if op.ctx.Err() != nil && mounted {
+			if err := s.diskMgr.Unmount(); err != nil {
+				log.Printf("Error unmounting USB drive after cancelled prep: %v", err)
+			}
+		}
+	}()
+	cancelled := func() bool { return op.ctx.Err() != nil }
+
+	s.mu.Lock()
+	if cancelled() {
+		s.mu.Unlock()
+		return nil
+	}
+	if s.rebootWatcher != nil {
+		log.Println("Cancelling pending reboot watcher (re-entering UMS)")
+		s.rebootWatcher()
+	}
+	// Serialize status publication with cancellation so a cancelled prep
+	// cannot overwrite the dispatcher's immediate idle publication.
+	s.setStatus("preparing")
+	s.mu.Unlock()
+	if _, err := s.client.Del("usb:log"); err != nil {
+		log.Printf("Warning: failed to clear usb:log: %v", err)
+	}
+	s.clearResult()
+
+	if cancelled() {
+		return nil
+	}
+	if err := s.diskMgr.Mount(); err != nil {
+		if !cancelled() {
+			s.setResult(resultError, "could not prepare the USB drive: %v", err)
+			s.setStatus("idle")
+			return fmt.Errorf("failed to mount drive: %w", err)
+		}
+		return nil
+	}
+	mounted = true
+	mountPoint := s.diskMgr.GetMountPoint()
+
+	type prepStep struct {
+		name string
+		run  func() error
+	}
+	steps := []prepStep{
+		{"settings", func() error { return s.settingsLdr.CopyToUSB(mountPoint) }},
+		{"updates", func() error {
+			return s.updateLdr.PrepareUSB(mountPoint, enteringUMSFromNormal(s.usbCtrl.GetCurrentMode()), umslog.New(s.client))
+		}},
+		{"maps", func() error { return s.mapsUpdater.PrepareUSB(mountPoint) }},
+		{"wireguard directory", func() error { return s.wgManager.PrepareUSB(mountPoint) }},
+		{"wireguard configs", func() error { return s.wgManager.CopyToUSB(mountPoint) }},
+		{"radio-gaga directory", func() error { return s.radioGagaMgr.PrepareUSB(mountPoint) }},
+		{"radio-gaga config", func() error { return s.radioGagaMgr.CopyToUSB(mountPoint) }},
+		{"uplink-service directory", func() error { return s.uplinkMgr.PrepareUSB(mountPoint) }},
+		{"uplink-service config", func() error { return s.uplinkMgr.CopyToUSB(mountPoint) }},
+		{"onboot", func() error { return s.onbootMgr.CopyToUSB(mountPoint) }},
+		{"log-bundles directory", func() error { return s.logBundlesMgr.PrepareUSB(mountPoint) }},
+		{"log bundles", func() error { return s.logBundlesMgr.CopyToUSB(mountPoint) }},
+		{"diagnostics", func() error { s.diagnostics.CollectToUSB(mountPoint); return nil }},
+		{"scripts", func() error { return s.scriptRunner.PrepareUSB(mountPoint) }},
+	}
+	for _, step := range steps {
+		if cancelled() {
+			return nil
+		}
+		if err := step.run(); err != nil && !cancelled() {
+			log.Printf("Error preparing %s: %v", step.name, err)
+		}
+	}
+
+	if cancelled() {
+		return nil
+	}
+	if err := s.diskMgr.Unmount(); err != nil {
+		if !cancelled() {
+			s.setStatus("idle")
+			return fmt.Errorf("failed to unmount drive: %w", err)
+		}
+		return nil
+	}
+	mounted = false
+	if cancelled() {
+		return nil
+	}
+
+	// Serialize the final gadget transition with cancellation. A request that
+	// wins this lock cancels the prep before it can publish active or attach UMS.
+	s.mu.Lock()
+	if cancelled() {
+		s.mu.Unlock()
+		return nil
+	}
+	// Publish status BEFORE switching USB — DBC can still read Redis via g_ether.
+	s.setStatus("active")
+	s.setLEDs(ledsUMSActive)
+	if err := s.usbCtrl.SwitchMode("ums"); err != nil {
+		s.setStatus("idle")
+		s.setLEDs(ledsOff)
+		s.mu.Unlock()
+		return fmt.Errorf("failed to switch to UMS mode: %w", err)
+	}
+
+	s.umsModeType = op.target
+	s.detachCount = 0
+	s.mu.Unlock()
+	log.Printf("Switched to UMS mode (type: %s)", op.target)
+	return nil
+}
+
+// switchToNormal remains the synchronous-call-site wrapper while transitions
+// are dispatched asynchronously.
 func (s *Service) switchToNormal(prevMode string) error {
+	_ = prevMode
+	s.requestMode("normal")
+	return nil
+}
+
+func (s *Service) runNormalOp(op *operation) error {
+	return s.runSwitchToNormal(s.usbCtrl.GetCurrentMode())
+}
+
+func (s *Service) runSwitchToNormal(prevMode string) error {
 	s.setLEDs(ledsOff)
 
 	if err := s.usbCtrl.SwitchMode("normal"); err != nil {
@@ -540,7 +662,9 @@ func (s *Service) switchToNormal(prevMode string) error {
 		}
 	}
 
+	s.mu.Lock()
 	s.umsModeType = ""
+	s.mu.Unlock()
 	s.setStep("")
 
 	if err == nil && (queued.MDB || queued.DBC) {
@@ -560,13 +684,14 @@ func (s *Service) switchToNormal(prevMode string) error {
 
 // startRebootWatcher launches a goroutine that subscribes to the ota
 // hash, performs the queued install LPushes, waits for completion, and
-// triggers a reboot. Must be called with s.mu held (so writes to
-// s.rebootWatcher / s.rebootGen are race-free with switchToUMS).
+// triggers a reboot.
 func (s *Service) startRebootWatcher(queued update.Queued) {
+	s.mu.Lock()
 	ctx, cancel := context.WithCancel(s.serviceCtx)
 	s.rebootWatcher = cancel
 	s.rebootGen++
 	myGen := s.rebootGen
+	s.mu.Unlock()
 	s.setStatus("awaiting-reboot")
 	go s.awaitInstallsAndReboot(ctx, queued, myGen)
 }
@@ -937,47 +1062,42 @@ func readDirWithRetry(path string) ([]os.DirEntry, error) {
 // the ums-by-dbc mode which requires two disconnects before switching back.
 func (s *Service) onDeviceDetached() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	currentMode := s.usbCtrl.GetCurrentMode()
-	if currentMode != "ums" {
+	current := s.currentOp
+	if s.usbCtrl.GetCurrentMode() != "ums" || current == nil || !isUMSTarget(current.target) {
+		s.mu.Unlock()
 		return
 	}
-
 	s.detachCount++
-	log.Printf("USB detach #%d detected (mode type: %s)", s.detachCount, s.umsModeType)
+	count := s.detachCount
+	target := current.target
+	s.mu.Unlock()
 
-	switch s.umsModeType {
+	log.Printf("USB detach #%d detected (mode type: %s)", count, target)
+	switch target {
 	case "ums":
-		if s.detachCount >= 1 {
-			log.Println("ums mode: switching to normal after disconnect")
-			s.doSwitchToNormal()
-		}
+		log.Println("ums mode: switching to normal after disconnect")
+		s.doSwitchToNormal()
 	case "ums-by-dbc":
-		if s.detachCount == 1 {
+		if count == 1 {
 			log.Println("ums-by-dbc mode: first disconnect, waiting for PC")
 			s.setLEDs(ledsWaitingPC)
 			return
 		}
-		if s.detachCount >= 2 {
-			log.Println("ums-by-dbc mode: second disconnect, switching to normal")
-			s.doSwitchToNormal()
-		}
+		log.Println("ums-by-dbc mode: second disconnect, switching to normal")
+		s.doSwitchToNormal()
 	default:
-		log.Printf("Unknown UMS mode type %q, switching to normal", s.umsModeType)
+		log.Printf("Unknown UMS mode type %q, switching to normal", target)
 		s.doSwitchToNormal()
 	}
 }
 
-// doSwitchToNormal performs the switch without re-acquiring the mutex.
-// Must be called with s.mu held.
+// doSwitchToNormal preserves the existing callers while routing the exit
+// through the dispatcher.
 func (s *Service) doSwitchToNormal() {
-	prevMode := s.usbCtrl.GetCurrentMode()
-	if err := s.switchToNormal(prevMode); err != nil {
-		log.Printf("Error switching to normal mode: %v", err)
-	}
+	s.requestMode("normal")
+	s.mu.Lock()
 	s.detachCount = 0
-
+	s.mu.Unlock()
 	if err := s.publisher.Set("mode", "normal", ipc.Sync()); err != nil {
 		log.Printf("Error updating Redis usb mode: %v", err)
 	}
@@ -1024,6 +1144,16 @@ func (s *Service) setLEDs(p ledPattern) {
 func (s *Service) setStatus(status string) {
 	if err := s.publisher.Set("status", status, ipc.Sync()); err != nil {
 		log.Printf("Error publishing usb status %q: %v", status, err)
+	}
+}
+
+// publishIdle atomically clears progress when a UMS preparation is cancelled.
+func (s *Service) publishIdle() {
+	if err := s.publisher.SetMany(map[string]any{
+		"status": "idle",
+		"step":   "",
+	}, ipc.Sync()); err != nil {
+		log.Printf("Error publishing idle USB status: %v", err)
 	}
 }
 
