@@ -304,3 +304,19 @@ func TestNotificationPayload(t *testing.T) {
 		t.Errorf("caps not applied: title=%d body=%d, want 120/512", len(long.Title), len(long.Body))
 	}
 }
+
+// TestEnteringUMSFromNormal pins the re-entry policy: the stale-artifact sweep
+// runs only when the drive is handed over fresh from normal mode. Re-entering
+// UMS while a UMS variant is already exporting (ums -> ums-by-dbc) must leave
+// host-written, not-yet-imported files alone.
+func TestEnteringUMSFromNormal(t *testing.T) {
+	if !enteringUMSFromNormal("normal") {
+		t.Error("entering from normal must sweep the stale artifacts")
+	}
+	if enteringUMSFromNormal("ums") {
+		t.Error("re-entering from ums must not sweep")
+	}
+	if enteringUMSFromNormal("ums-by-dbc") {
+		t.Error("re-entering from ums-by-dbc must not sweep")
+	}
+}

@@ -113,14 +113,14 @@ func TestPrepareUSBDiscardsStaleUpdateFiles(t *testing.T) {
 		"librescoot-unu-mdb-nightly-20260102T000000.mender",
 		"librescoot-unu-dbc-nightly-20260102T000000.delta",
 	}
-	for _, n := range append(append([]string{}, leftovers...), "notes.txt") {
+	for _, n := range append(append([]string{}, leftovers...), "notes.txt", "notes.delta") {
 		if err := os.WriteFile(filepath.Join(updateDir, n), []byte("x"), 0644); err != nil {
 			t.Fatal(err)
 		}
 	}
 
 	l := &Loader{}
-	if err := l.PrepareUSB(usb, nil); err != nil {
+	if err := l.PrepareUSB(usb, true, nil); err != nil {
 		t.Fatalf("PrepareUSB: %v", err)
 	}
 	for _, n := range leftovers {
@@ -128,13 +128,40 @@ func TestPrepareUSBDiscardsStaleUpdateFiles(t *testing.T) {
 			t.Errorf("stale update file %s survived: %v", n, err)
 		}
 	}
-	if _, err := os.Stat(filepath.Join(updateDir, "notes.txt")); err != nil {
-		t.Errorf("non-update file was removed: %v", err)
+	// Notes and a user's own notes.delta are not artifacts UMS would import,
+	// so the sweep must leave them alone.
+	for _, n := range []string{"notes.txt", "notes.delta"} {
+		if _, err := os.Stat(filepath.Join(updateDir, n)); err != nil {
+			t.Errorf("non-artifact file %s was removed: %v", n, err)
+		}
 	}
 
 	// Clean case: re-entering with the directory already prepared is a no-op.
-	if err := l.PrepareUSB(usb, nil); err != nil {
+	if err := l.PrepareUSB(usb, true, nil); err != nil {
 		t.Fatalf("PrepareUSB on a clean directory: %v", err)
+	}
+}
+
+// TestPrepareUSBKeepsStaleWhenNotSweeping pins the re-entry guard: when
+// discardStale is false (ums -> ums-by-dbc while the drive is still exported),
+// an artifact the host wrote but that has not been imported yet survives.
+func TestPrepareUSBKeepsStaleWhenNotSweeping(t *testing.T) {
+	usb := t.TempDir()
+	updateDir := filepath.Join(usb, "system-update")
+	if err := os.MkdirAll(updateDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	staged := "librescoot-unu-mdb-nightly-20260102T000000.mender"
+	if err := os.WriteFile(filepath.Join(updateDir, staged), []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	l := &Loader{}
+	if err := l.PrepareUSB(usb, false, nil); err != nil {
+		t.Fatalf("PrepareUSB: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(updateDir, staged)); err != nil {
+		t.Errorf("host-written artifact %s was swept on re-entry: %v", staged, err)
 	}
 }
 

@@ -300,26 +300,31 @@ func parseSemver(v string) (bool, [3]int) {
 	return true, out
 }
 
-// PrepareUSB creates the system-update directory on the exported drive and
-// discards any update artifacts a previous cycle left there. The exit path's
-// CleanDrive() wipes the drive after a completed cycle, so a file that survives
-// to the next entry is the residue of a cycle that died before it could exit;
-// leaving it would present it to the host and import it again on the next exit.
+// PrepareUSB creates the system-update directory on the exported drive and,
+// when discardStale is set, discards any update artifacts a previous cycle left
+// there. The exit path's CleanDrive() wipes the drive after a completed cycle,
+// so a file that survives to the next entry is the residue of a cycle that died
+// before it could exit; leaving it would present it to the host and import it
+// again on the next exit. discardStale is false when re-entering UMS from an
+// already-exporting mode (ums -> ums-by-dbc): the drive was never handed back,
+// so host-written files that have not been imported yet must not be swept.
 // This only touches the on-drive directory: /data/ota staging and
 // update-service's delta base are deliberately untouched.
-func (l *Loader) PrepareUSB(usbMountPath string, logger *umslog.Logger) error {
+func (l *Loader) PrepareUSB(usbMountPath string, discardStale bool, logger *umslog.Logger) error {
 	updateDir := filepath.Join(usbMountPath, "system-update")
 	if err := os.MkdirAll(updateDir, 0755); err != nil {
 		return fmt.Errorf("failed to create system-update directory: %w", err)
 	}
-	discarded, err := discardStaleUpdateFiles(updateDir)
-	if err != nil {
-		return fmt.Errorf("failed to inspect system-update directory: %w", err)
-	}
-	if discarded > 0 {
-		log.Printf("Discarded %d stale update file(s) left in %s by a previous cycle", discarded, updateDir)
-		if logger != nil {
-			logger.Logf("updates", "discarded stale update files left by a previous cycle (%d file(s))", discarded)
+	if discardStale {
+		discarded, err := discardStaleUpdateFiles(updateDir)
+		if err != nil {
+			return fmt.Errorf("failed to inspect system-update directory: %w", err)
+		}
+		if discarded > 0 {
+			log.Printf("Discarded %d stale update file(s) left in %s by a previous cycle", discarded, updateDir)
+			if logger != nil {
+				logger.Logf("updates", "discarded stale update files left by a previous cycle (%d file(s))", discarded)
+			}
 		}
 	}
 	log.Println("Created system-update directory on USB drive")
@@ -327,7 +332,9 @@ func (l *Loader) PrepareUSB(usbMountPath string, logger *umslog.Logger) error {
 }
 
 // discardStaleUpdateFiles removes the update artifacts left on the exported
-// drive and reports how many it removed. Non-artifact files are left alone.
+// drive and reports how many it removed. Only files UMS would itself treat as
+// artifacts (librescoot-*-{mdb,dbc}.mender/.delta, via updateArtifactTarget)
+// are removed; a user's unrelated notes.delta or other file is left alone.
 func discardStaleUpdateFiles(dir string) (int, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -335,7 +342,7 @@ func discardStaleUpdateFiles(dir string) (int, error) {
 	}
 	discarded := 0
 	for _, entry := range entries {
-		if entry.IsDir() || !isUpdateFile(entry.Name()) {
+		if entry.IsDir() || updateArtifactTarget(entry.Name()) == "" {
 			continue
 		}
 		path := filepath.Join(dir, entry.Name())

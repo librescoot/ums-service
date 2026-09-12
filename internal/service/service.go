@@ -244,7 +244,7 @@ func (s *Service) handleModeChange(mode string) error {
 
 	switch mode {
 	case "ums", "ums-by-dbc":
-		return s.switchToUMS(mode)
+		return s.switchToUMS(mode, enteringUMSFromNormal(prevMode))
 	case "normal":
 		return s.switchToNormal(prevMode)
 	default:
@@ -256,7 +256,15 @@ func (s *Service) handleModeChange(mode string) error {
 	}
 }
 
-func (s *Service) switchToUMS(mode string) error {
+// enteringUMSFromNormal reports whether this UMS entry hands the drive over
+// fresh from normal mode. A re-entry while a UMS variant is already exporting
+// (ums -> ums-by-dbc) must not sweep the drive: the drive was never handed
+// back, so host-written files there have not been imported yet.
+func enteringUMSFromNormal(prevMode string) bool {
+	return prevMode != "ums" && prevMode != "ums-by-dbc"
+}
+
+func (s *Service) switchToUMS(mode string, discardStale bool) error {
 	// Only a hold that lands from here on counts as cancelling this entry.
 	s.cancelPending.Store(false)
 	s.setStatus("preparing")
@@ -287,7 +295,7 @@ func (s *Service) switchToUMS(mode string) error {
 		log.Printf("Error copying settings to USB: %v", err)
 	}
 
-	if err := s.updateLdr.PrepareUSB(mountPoint, umslog.New(s.client)); err != nil {
+	if err := s.updateLdr.PrepareUSB(mountPoint, discardStale, umslog.New(s.client)); err != nil {
 		log.Printf("Error preparing update directory: %v", err)
 	}
 
