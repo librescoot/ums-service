@@ -36,6 +36,12 @@ func (m *Manager) Initialize() error {
 	if err := m.ensureDriveExists(); err != nil {
 		return fmt.Errorf("failed to ensure drive exists: %w", err)
 	}
+
+	// Verify at start rather than on the first UMS entry, where discovery of a
+	// corrupt drive used to block the user behind a full recreation.
+	if _, err := m.verifyFilesystem(); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -261,30 +267,46 @@ func (m *Manager) replaceCorruptDrive() error {
 	return nil
 }
 
-func (m *Manager) Mount() error {
+// verifyFilesystem checks the drive, repairing it or replacing it when that is
+// the only way out. replaced reports that the drive was recreated, so a
+// user-facing caller can say the files on it are gone.
+func (m *Manager) verifyFilesystem() (replaced bool, err error) {
 	if checkErr := m.checkFilesystem(); checkErr != nil {
 		var unrecoverable *unrecoverableFilesystemError
 		if errors.As(checkErr, &unrecoverable) {
 			if replaceErr := m.replaceCorruptDrive(); replaceErr != nil {
-				return fmt.Errorf("filesystem is corrupt (%v) and replacement failed: %w", checkErr, replaceErr)
+				return false, fmt.Errorf("filesystem is corrupt (%v) and replacement failed: %w", checkErr, replaceErr)
 			}
-			return fmt.Errorf("filesystem was unrecoverable and was replaced; reconnect the USB drive, copy the files again, and retry: %v", checkErr)
+			log.Printf("Replaced unrecoverable USB filesystem: %v", checkErr)
+			return true, nil
 		}
 		if !hasFilesystemErrors(checkErr) {
-			return fmt.Errorf("could not check USB filesystem: %w", checkErr)
+			return false, fmt.Errorf("could not check USB filesystem: %w", checkErr)
 		}
 		log.Printf("Filesystem check failed: %v — attempting repair", checkErr)
 		if repairErr := m.repairFilesystem(); repairErr != nil {
-			var unrecoverable *unrecoverableFilesystemError
-			if !errors.As(repairErr, &unrecoverable) {
-				return fmt.Errorf("could not repair USB filesystem: %w", repairErr)
+			var repairUnrecoverable *unrecoverableFilesystemError
+			if !errors.As(repairErr, &repairUnrecoverable) {
+				return false, fmt.Errorf("could not repair USB filesystem: %w", repairErr)
 			}
 			if replaceErr := m.replaceCorruptDrive(); replaceErr != nil {
-				return fmt.Errorf("filesystem is corrupt (%v), repair failed (%v), and replacement failed: %w", checkErr, repairErr, replaceErr)
+				return false, fmt.Errorf("filesystem is corrupt (%v), repair failed (%v), and replacement failed: %w", checkErr, repairErr, replaceErr)
 			}
-			return fmt.Errorf("filesystem was unrecoverable and was replaced; reconnect the USB drive, copy the files again, and retry: %v", repairErr)
+			log.Printf("Replaced unrecoverable USB filesystem after failed repair: %v", repairErr)
+			return true, nil
 		}
 		log.Println("Filesystem repaired successfully")
+	}
+	return false, nil
+}
+
+func (m *Manager) Mount() error {
+	replaced, err := m.verifyFilesystem()
+	if err != nil {
+		return err
+	}
+	if replaced {
+		return fmt.Errorf("filesystem was unrecoverable and was replaced; reconnect the USB drive, copy the files again, and retry")
 	}
 
 	if err := os.MkdirAll(m.mountPoint, 0755); err != nil {

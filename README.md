@@ -6,7 +6,7 @@ The UMS Service provides the vehicle's USB gadget workflow. It switches the MDB 
 ## Capabilities
 
 - Switches between `g_ether` (normal) and `g_mass_storage` (UMS) USB gadget modules.
-- Creates and manages a 1 GiB FAT-backed virtual drive at `/data/usb.drive` by default.
+- Creates and manages a 1 GiB FAT-backed virtual drive at `/data/usb.drive` by default, verified (and repaired or recreated) at service start rather than on the first UMS entry.
 - Exports and imports settings, WireGuard configuration, selected service configuration, and an optional boot script.
 - Queues full (`.mender`) and delta (`.delta`) MDB and DBC update artifacts, transfers DBC-bound content through the DBC interface, and waits for queued installation status before a permitted reboot.
 - Imports supported map archives and MDB/DBC scripts.

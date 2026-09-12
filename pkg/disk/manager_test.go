@@ -131,6 +131,46 @@ printf %s "$count" > "` + counter + `"
 	}
 }
 
+// Integrity is verified when the service starts, rather than on the first UMS
+// entry, where finding a corrupt drive used to block the user behind a
+// recreation they could not anticipate.
+func TestInitializeVerifiesAndRepairsFilesystemAtStartup(t *testing.T) {
+	dir := t.TempDir()
+	counter := filepath.Join(dir, "checks")
+	script := `#!/bin/sh
+count=0
+[ ! -f "` + counter + `" ] || count=$(cat "` + counter + `")
+count=$((count + 1))
+printf %s "$count" > "` + counter + `"
+if [ "$1" = "-a" ]; then exit 0; fi
+if [ "$count" -eq 1 ]; then exit 1; fi
+exit 0
+`
+	if err := os.WriteFile(filepath.Join(dir, "fsck.fat"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+
+	drive := filepath.Join(dir, "usb.drive")
+	if err := os.WriteFile(drive, make([]byte, 1<<20), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	m := NewManager(drive, 1<<20)
+	if err := m.Initialize(); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+
+	// check (-n, inconsistent) -> repair (-a) -> recheck (-n, clean)
+	got, err := os.ReadFile(counter)
+	if err != nil {
+		t.Fatalf("read counter: %v", err)
+	}
+	if string(got) != "3" {
+		t.Fatalf("fsck invocations = %s, want 3 (check, repair, recheck)", got)
+	}
+}
+
 func TestReplaceCorruptDriveKeepsOriginalWhenFormatFails(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "usb.drive")
