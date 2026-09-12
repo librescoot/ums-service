@@ -105,6 +105,12 @@ func TestWaitForCompletion_DBCOnly_WaitsForPostRebootIdle(t *testing.T) {
 }
 
 func TestWaitForCompletion_DBCOnly_PostRebootError(t *testing.T) {
+	// A post-reboot error that persists past the settle duration is a
+	// genuine failure, not the transient flip.
+	old := ErrorSettleDuration
+	ErrorSettleDuration = 60 * time.Millisecond
+	t.Cleanup(func() { ErrorSettleDuration = old })
+
 	src := newFakeOTASource(map[string]string{"dbc": "idle"})
 	q := Queued{DBC: true}
 
@@ -227,7 +233,12 @@ func TestWaitForCompletion_InitialPendingRebootIsStale(t *testing.T) {
 
 func TestWaitForCompletion_InitialPendingRebootThenError(t *testing.T) {
 	// Realistic stale path: mender refuses the new install because a
-	// previous one is staged.
+	// previous one is staged. The error persists past the settle
+	// duration, so the wait fails.
+	old := ErrorSettleDuration
+	ErrorSettleDuration = 60 * time.Millisecond
+	t.Cleanup(func() { ErrorSettleDuration = old })
+
 	src := newFakeOTASource(map[string]string{"mdb": "pending-reboot"})
 	q := Queued{MDB: true}
 
@@ -584,3 +595,214 @@ func (errorOTASource) Changes() <-chan StatusUpdate {
 	return make(chan StatusUpdate)
 }
 func (errorOTASource) Stop() {}
+
+// Bench regression for the 2026-09-12 combined UMS import: the DBC hit
+// a transient error flip in its reboot window (pending-reboot -> error
+// -> pending-reboot -> idle) while the install and commit succeeded.
+// The old wait failed immediately on the error and the caller retained
+// the MDB reboot-ownership claim, deadlocking update-service.
+
+func TestWaitForCompletion_TransientErrorRecovers(t *testing.T) {
+	src := newFakeOTASource(map[string]string{"mdb": "idle", "dbc": "idle"})
+	q := Queued{DBC: true, MDB: true}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- WaitForCompletion(context.Background(), src, q, 2*time.Second, 30*time.Second, nil)
+	}()
+
+	src.push("dbc", "installing")
+	src.push("dbc", "pending-reboot")
+	src.push("dbc", "error")
+	// Recovery: update-service reboots the DBC and it commits.
+	src.push("dbc", "pending-reboot")
+	src.push("dbc", "idle")
+	src.push("mdb", "installing")
+	src.push("mdb", "pending-reboot")
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("expected nil, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for awaiter to return")
+	}
+}
+
+func TestWaitForCompletion_SettledErrorFails(t *testing.T) {
+	old := ErrorSettleDuration
+	ErrorSettleDuration = 60 * time.Millisecond
+	t.Cleanup(func() { ErrorSettleDuration = old })
+
+	src := newFakeOTASource(map[string]string{"mdb": "idle", "dbc": "idle"})
+	q := Queued{DBC: true}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- WaitForCompletion(context.Background(), src, q, 5*time.Second, 30*time.Second, nil)
+	}()
+
+	src.push("dbc", "installing")
+	src.push("dbc", "pending-reboot")
+	src.push("dbc", "error")
+
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "install for dbc reported error") {
+			t.Fatalf("expected settled-error failure, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the settled error")
+	}
+}
+
+// TestWaitForCompletion_ErrorThenRecoveryDoesNotFail checks the settle
+// window itself: an error that recovers inside ErrorSettleDuration
+// must not fail the wait even when nothing else arrives for a while.
+func TestWaitForCompletion_ErrorThenRecoveryDoesNotFail(t *testing.T) {
+	old := ErrorSettleDuration
+	ErrorSettleDuration = 150 * time.Millisecond
+	t.Cleanup(func() { ErrorSettleDuration = old })
+
+	src := newFakeOTASource(map[string]string{"mdb": "idle"})
+	q := Queued{MDB: true}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- WaitForCompletion(context.Background(), src, q, 5*time.Second, 30*time.Second, nil)
+	}()
+
+	src.push("mdb", "installing")
+	src.push("mdb", "error")
+	time.Sleep(50 * time.Millisecond) // inside the settle window
+	src.push("mdb", "pending-reboot")
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("expected nil, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for awaiter to return")
+	}
+}
+
+// TestWaitForCompletion_DBCOnlySettledErrorFails pins that a DBC-only
+// wait also honors the settle duration before failing.
+func TestWaitForCompletion_DBCOnlySettledErrorFails(t *testing.T) {
+	old := ErrorSettleDuration
+	ErrorSettleDuration = 60 * time.Millisecond
+	t.Cleanup(func() { ErrorSettleDuration = old })
+
+	src := newFakeOTASource(map[string]string{"dbc": "idle"})
+	q := Queued{DBC: true}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- WaitForCompletion(context.Background(), src, q, 5*time.Second, 30*time.Second, nil)
+	}()
+
+	src.push("dbc", "installing")
+	src.push("dbc", "error")
+
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "install for dbc reported error") {
+			t.Fatalf("expected settled-error failure, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the settled error")
+	}
+}
+
+func TestRecordingSourceTracksHistory(t *testing.T) {
+	src := newFakeOTASource(map[string]string{"dbc": "idle"})
+	rec := NewRecordingSource(src)
+	defer rec.Stop()
+
+	q := Queued{DBC: true}
+	done := make(chan error, 1)
+	go func() {
+		done <- WaitForCompletion(context.Background(), rec, q, 2*time.Second, 10*time.Second, nil)
+	}()
+
+	src.push("dbc", "installing")
+	src.push("dbc", "pending-reboot")
+	src.push("dbc", "error")
+	src.push("dbc", "pending-reboot")
+	src.push("dbc", "idle")
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("expected nil, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for awaiter to return")
+	}
+
+	if got := rec.Last("dbc"); got != "idle" {
+		t.Fatalf("Last(dbc) = %q, want idle", got)
+	}
+	if !rec.Saw("dbc", "error") {
+		t.Fatal("Saw(dbc, error) = false, want true")
+	}
+	if !rec.Saw("dbc", "pending-reboot") {
+		t.Fatal("Saw(dbc, pending-reboot) = false, want true")
+	}
+	if rec.Saw("mdb", "idle") {
+		t.Fatal("Saw(mdb, idle) = true, want false (component never updated)")
+	}
+	if !InstallRecovered(rec, q) {
+		t.Fatal("InstallRecovered = false, want true (DBC completed after its own pending-reboot)")
+	}
+}
+
+func TestInstallRecovered(t *testing.T) {
+	t.Run("DBC recovered", func(t *testing.T) {
+		src := newFakeOTASource(map[string]string{"dbc": "idle"})
+		rec := NewRecordingSource(src)
+		defer rec.Stop()
+		rec.record(StatusUpdate{Component: "dbc", Status: "installing"})
+		rec.record(StatusUpdate{Component: "dbc", Status: "pending-reboot"})
+		rec.record(StatusUpdate{Component: "dbc", Status: "idle"})
+		if !InstallRecovered(rec, Queued{DBC: true}) {
+			t.Fatal("InstallRecovered = false, want true")
+		}
+	})
+	t.Run("DBC stuck in error", func(t *testing.T) {
+		src := newFakeOTASource(map[string]string{"dbc": "idle"})
+		rec := NewRecordingSource(src)
+		defer rec.Stop()
+		rec.record(StatusUpdate{Component: "dbc", Status: "installing"})
+		rec.record(StatusUpdate{Component: "dbc", Status: "error"})
+		if InstallRecovered(rec, Queued{DBC: true}) {
+			t.Fatal("InstallRecovered = true, want false (DBC never recovered)")
+		}
+	})
+	t.Run("DBC idle without its own pending-reboot", func(t *testing.T) {
+		src := newFakeOTASource(map[string]string{"dbc": "idle"})
+		rec := NewRecordingSource(src)
+		defer rec.Stop()
+		rec.record(StatusUpdate{Component: "dbc", Status: "idle"})
+		if InstallRecovered(rec, Queued{DBC: true}) {
+			t.Fatal("InstallRecovered = true, want false (stale idle, install never started)")
+		}
+	})
+	t.Run("combined requires MDB pending-reboot", func(t *testing.T) {
+		src := newFakeOTASource(map[string]string{"mdb": "idle", "dbc": "idle"})
+		rec := NewRecordingSource(src)
+		defer rec.Stop()
+		rec.record(StatusUpdate{Component: "dbc", Status: "pending-reboot"})
+		rec.record(StatusUpdate{Component: "dbc", Status: "idle"})
+		rec.record(StatusUpdate{Component: "mdb", Status: "installing"})
+		if InstallRecovered(rec, Queued{DBC: true, MDB: true}) {
+			t.Fatal("InstallRecovered = true, want false (MDB not at pending-reboot)")
+		}
+		rec.record(StatusUpdate{Component: "mdb", Status: "pending-reboot"})
+		if !InstallRecovered(rec, Queued{DBC: true, MDB: true}) {
+			t.Fatal("InstallRecovered = false, want true")
+		}
+	})
+}

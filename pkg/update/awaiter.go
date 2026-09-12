@@ -14,6 +14,14 @@ const (
 	statusError         = "error"
 )
 
+// ErrorSettleDuration is how long a watched component must remain in
+// error status before the wait concludes the install actually failed.
+// update-service has a known transient error flip in the reboot window
+// (observed on the bench: pending-reboot -> error -> pending-reboot ->
+// idle with the install and commit succeeding), so an error alone is
+// not a failure verdict. Tests shorten this to keep runs fast.
+var ErrorSettleDuration = 30 * time.Second
+
 // StatusUpdate is a change observed on one component's OTA status.
 type StatusUpdate struct {
 	Component string // "mdb" or "dbc"
@@ -50,6 +58,12 @@ type awaiterState struct {
 	// done becomes true at pending-reboot for MDB-driven installs, or
 	// at the final idle status for a DBC-only install.
 	done bool
+	// errorAt is the time an error status was last observed for the
+	// component, or zero while the component is not (or no longer) in
+	// error. A later transition away from error clears it; the settle
+	// timer only fails the wait when an error has persisted for
+	// ErrorSettleDuration.
+	errorAt time.Time
 }
 
 // installInProgress reports whether any of the given components is
@@ -100,9 +114,15 @@ func installInProgress(source OTAStatusSource, components []string) bool {
 //
 // onPending receives the sorted, non-empty set of unfinished components.
 //
+// A watched component entering error status does not fail the wait
+// immediately: the error must persist for ErrorSettleDuration before
+// the wait concludes failure, so a transient flip followed by recovery
+// (pending-reboot, idle) keeps the wait alive.
+//
 // Returns nil on success, an error wrapping context.DeadlineExceeded on
 // final timeout, an error wrapping context.Canceled on ctx cancellation,
-// or an error naming the component that went to error status.
+// or an error naming the component whose error status persisted past
+// the settle duration.
 func WaitForCompletion(ctx context.Context, source OTAStatusSource, q Queued, windowTimeout, overallCap time.Duration, onPending func([]string)) error {
 	required := RequiredComponents(q)
 	if len(required) == 0 {
@@ -145,6 +165,48 @@ func WaitForCompletion(ctx context.Context, source OTAStatusSource, q Queued, wi
 	}
 
 	updates := source.Changes()
+	// errorSettle fires ErrorSettleDuration after the earliest
+	// un-cleared error observation, so a transient error flip does not
+	// fail the wait while a genuinely stuck error still does.
+	var settleTimer *time.Timer
+	var settleC <-chan time.Time
+	armSettle := func() {
+		earliest := time.Time{}
+		for _, st := range states {
+			if !st.errorAt.IsZero() && (earliest.IsZero() || st.errorAt.Before(earliest)) {
+				earliest = st.errorAt
+			}
+		}
+		if earliest.IsZero() {
+			if settleTimer != nil {
+				settleTimer.Stop()
+				settleTimer = nil
+				settleC = nil
+			}
+			return
+		}
+		delay := earliest.Add(ErrorSettleDuration).Sub(time.Now())
+		if delay < 0 {
+			delay = 0
+		}
+		if settleTimer == nil {
+			settleTimer = time.NewTimer(delay)
+		} else {
+			if !settleTimer.Stop() {
+				select {
+				case <-settleTimer.C:
+				default:
+				}
+			}
+			settleTimer.Reset(delay)
+		}
+		settleC = settleTimer.C
+	}
+	defer func() {
+		if settleTimer != nil {
+			settleTimer.Stop()
+		}
+	}()
 	for {
 		select {
 		case <-ctx.Done():
@@ -157,6 +219,30 @@ func WaitForCompletion(ctx context.Context, source OTAStatusSource, q Queued, wi
 				return fmt.Errorf("waiting for install completion: %w", context.DeadlineExceeded)
 			}
 			window.Reset(windowTimeout)
+		case <-settleC:
+			// The earliest observed error has had the settle duration to
+			// recover. Fail only if the component is still in error; a
+			// recovery event we somehow missed clears the state instead.
+			failed := ""
+			now := time.Now()
+			for c, st := range states {
+				if st.errorAt.IsZero() {
+					continue
+				}
+				cur, err := source.Current(c)
+				if err != nil || cur == statusError {
+					if now.Sub(st.errorAt) >= ErrorSettleDuration {
+						failed = c
+						break
+					}
+				} else {
+					st.errorAt = time.Time{}
+				}
+			}
+			if failed != "" {
+				return fmt.Errorf("install for %s reported error", failed)
+			}
+			armSettle()
 		case u, ok := <-updates:
 			if !ok {
 				return fmt.Errorf("ota status source closed before completion")
@@ -167,6 +253,7 @@ func WaitForCompletion(ctx context.Context, source OTAStatusSource, q Queued, wi
 			}
 			switch u.Status {
 			case statusPendingReboot:
+				st.errorAt = time.Time{}
 				if st.sawNonPendingReboot && !st.done {
 					if waitForDBCFinal && u.Component == "dbc" {
 						st.sawPendingReboot = true
@@ -180,12 +267,21 @@ func WaitForCompletion(ctx context.Context, source OTAStatusSource, q Queued, wi
 				}
 			case statusError:
 				if st.sawNonPendingReboot {
-					return fmt.Errorf("install for %s reported error", u.Component)
+					// Do not fail yet: hold the error open for the settle
+					// duration so a transient flip followed by recovery
+					// keeps the wait alive (bench: pending-reboot ->
+					// error -> pending-reboot -> idle, install fine).
+					if st.errorAt.IsZero() {
+						st.errorAt = time.Now()
+						armSettle()
+					}
+					continue
 				}
 				// Pre-existing error before we saw any install
 				// activity — treat as starting state, like idle.
 				st.sawNonPendingReboot = true
 			case statusIdle:
+				st.errorAt = time.Time{}
 				st.sawNonPendingReboot = true
 				if waitForDBCFinal && u.Component == "dbc" && st.sawPendingReboot {
 					st.done = true
@@ -195,6 +291,7 @@ func WaitForCompletion(ctx context.Context, source OTAStatusSource, q Queued, wi
 					notify()
 				}
 			default:
+				st.errorAt = time.Time{}
 				st.sawNonPendingReboot = true
 			}
 		}

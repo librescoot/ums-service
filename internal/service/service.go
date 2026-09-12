@@ -167,20 +167,17 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 
 	s.runStartupCleanup()
-	// Clear a claim orphaned by a prior process only when no install remains
-	// active. Pending/installing state keeps the fail-safe ownership in place.
+	// Reconcile the MDB reboot-owner claim with what actually happened
+	// before this process started. Invariant: the claim is held by a
+	// live awaiter; a restarted ums-service adopts an install that
+	// already completed (MDB at pending-reboot) when no other component
+	// is mid-flight, because update-service defers to the claim and
+	// would otherwise wait forever for a reboot nobody owns. Any other
+	// active install keeps the claim with its (dead) owner — that is
+	// the existing fail-safe — and pending/error/idle states clear or
+	// keep it as before.
 	if ota, err := s.client.HGetAll("ota"); err == nil {
-		mdb := ota["status:mdb"]
-		dbc := ota["status:dbc"]
-		if (mdb == "" || mdb == "idle" || mdb == "error") &&
-			(dbc == "" || dbc == "idle" || dbc == "error") {
-			if err := s.client.HSet("ota", "reboot-owner:mdb", ""); err != nil {
-				log.Printf("Failed to clear orphaned MDB reboot ownership: %v", err)
-			}
-			if err := os.Remove(mdbRebootOwnerPath); err != nil && !os.IsNotExist(err) {
-				log.Printf("Failed to clear orphaned MDB reboot owner file: %v", err)
-			}
-		}
+		s.reconcileRebootOwner(ota)
 	}
 
 	s.usbCtrl.StartMonitoring()
@@ -399,7 +396,21 @@ func (s *Service) switchToNormal(prevMode string) error {
 	mountPoint := s.diskMgr.GetMountPoint()
 	logger := umslog.New(s.client)
 
-	needDBC := s.checkIfDBCNeeded(mountPoint)
+	needDBC, err := s.checkIfDBCNeeded(mountPoint)
+	if err != nil {
+		// Abort before per-file processing and before the drive is
+		// cleaned: the staged artifacts stay on the drive and are
+		// imported by the next detach instead of being silently lost.
+		logger.Error("dbc", "scan failed: %v", err)
+		log.Printf("Error scanning the USB drive: %v", err)
+		s.setResult(resultError, "could not scan the USB drive: %v", err)
+		s.setStep("")
+		s.setStatus("idle")
+		if umountErr := s.diskMgr.Unmount(); umountErr != nil {
+			log.Printf("Error unmounting USB drive after scan failure: %v", umountErr)
+		}
+		return fmt.Errorf("scan the USB drive: %w", err)
+	}
 
 	if needDBC {
 		if err := s.dbcInterface.Enable(ctx); err != nil {
@@ -573,6 +584,9 @@ func (s *Service) awaitInstallsAndReboot(ctx context.Context, queued update.Queu
 		return
 	}
 	defer source.Stop()
+	// Recording keeps the observed status history so a failed wait can
+	// be re-checked against what actually happened (InstallRecovered).
+	rec := update.NewRecordingSource(source)
 
 	// update-service normally owns MDB reboot scheduling. Claim it before
 	// publishing install requests so combined imports cannot reboot the MDB
@@ -645,23 +659,35 @@ func (s *Service) awaitInstallsAndReboot(ctx context.Context, queued update.Queu
 		s.setStep("waiting-" + strings.Join(components, "+"))
 	}
 
-	if err := update.WaitForCompletion(ctx, source, queued, installAwaitTimeout, installOverallCap, onPending); err != nil {
-		logger.Error("reboot", "skip: %v", err)
-		log.Printf("awaiter: skip reboot: %v", err)
-		switch {
-		case errors.Is(err, context.Canceled):
-			// A new UMS entry clears the superseded result.
-		case errors.Is(err, context.DeadlineExceeded):
-			s.setResult(resultTimeout, "install did not finish within %s (still waiting on %s)",
-				installOverallCap, strings.Join(pending, ", "))
-		default:
-			s.setResult(resultInstallError, "%v", err)
+	if err := update.WaitForCompletion(ctx, rec, queued, installAwaitTimeout, installOverallCap, onPending); err != nil {
+		if !errors.Is(err, context.Canceled) && update.InstallRecovered(rec, queued) {
+			// The wait gave up, but the recording shows every queued
+			// install actually recovered to its completed state (bench:
+			// a transient DBC error flip made the old code retain the
+			// reboot-owner claim while the MDB sat at pending-reboot,
+			// deadlocking update-service). Finish the cycle normally.
+			logger.Logf("reboot", "wait ended with %v but installs recovered; completing the reboot", err)
+			log.Printf("awaiter: %v, but installs recovered; completing reboot", err)
+		} else {
+			logger.Error("reboot", "skip: %v", err)
+			log.Printf("awaiter: skip reboot: %v", err)
+			switch {
+			case errors.Is(err, context.Canceled):
+				// A new UMS entry clears the superseded result.
+			case errors.Is(err, context.DeadlineExceeded):
+				s.setResult(resultTimeout, "install did not finish within %s (still waiting on %s)",
+					installOverallCap, strings.Join(pending, ", "))
+			default:
+				s.setResult(resultInstallError, "%v", err)
+			}
+			return
 		}
-		return
 	}
 
-	// All queued installers are now terminal. It is safe to release MDB reboot
-	// ownership on any subsequent return; timeout/error paths above retain it.
+	// All queued installers are now terminal — or the wait failed but
+	// InstallRecovered verified they recovered to their completed
+	// states. It is safe to release MDB reboot ownership on any
+	// subsequent return; the retained-claim paths returned above.
 	releaseRebootOwner = true
 
 	if queued.DBC && !queued.MDB {
@@ -707,38 +733,161 @@ func (s *Service) awaitInstallsAndReboot(ctx context.Context, queued update.Queu
 	log.Println("awaiter: MDB reboot triggered")
 }
 
-func (s *Service) checkIfDBCNeeded(mountPoint string) bool {
+// ownerAction is what reconcileRebootOwner should do with a stale
+// reboot-owner claim found at startup.
+type ownerAction int
+
+const (
+	// ownerKeep leaves the claim in place: an install is genuinely
+	// still active, or a completed one cannot safely be adopted yet.
+	ownerKeep ownerAction = iota
+	// ownerClear removes the claim: nothing is pending any more.
+	ownerClear
+	// ownerAdopt means the MDB install completed while the previous
+	// process was dying; the restarted service must clear the claim
+	// and finish the reboot itself.
+	ownerAdopt
+)
+
+// decideRebootOwnerAction classifies a startup ota snapshot. owner is
+// the Redis reboot-owner value; ownerHeld reports whether the on-disk
+// claim marker exists.
+func decideRebootOwnerAction(mdb, dbc, owner string, ownerHeld bool) ownerAction {
+	if !ownerHeld && owner != "ums" {
+		return ownerKeep
+	}
+	switch {
+	case mdb == "pending-reboot":
+		switch dbc {
+		case "downloading", "preparing", "installing", "pending-reboot":
+			// The DBC is still mid-install; adopting now would reboot
+			// the MDB out from under a live combined activation.
+			return ownerKeep
+		default:
+			return ownerAdopt
+		}
+	case mdb == "downloading" || mdb == "preparing" || mdb == "installing":
+		return ownerKeep
+	case mdb == "" || mdb == "idle" || mdb == "error":
+		if dbc == "downloading" || dbc == "preparing" || dbc == "installing" || dbc == "pending-reboot" {
+			// A DBC install may still be activating; keep the fail-safe
+			// claim until it settles.
+			return ownerKeep
+		}
+		return ownerClear
+	default:
+		return ownerKeep
+	}
+}
+
+// clearRebootOwner removes the claim from Redis and from disk.
+func (s *Service) clearRebootOwner() {
+	if err := s.client.HSet("ota", "reboot-owner:mdb", ""); err != nil {
+		log.Printf("Failed to clear orphaned MDB reboot ownership: %v", err)
+		return
+	}
+	if err := os.Remove(mdbRebootOwnerPath); err != nil && !os.IsNotExist(err) {
+		log.Printf("Failed to clear orphaned MDB reboot owner file: %v", err)
+	}
+}
+
+// reconcileRebootOwner applies the startup decision for a stale claim.
+func (s *Service) reconcileRebootOwner(ota map[string]string) {
+	mdb := ota["status:mdb"]
+	dbc := ota["status:dbc"]
+	owner := ota["reboot-owner:mdb"]
+	_, ownerFileErr := os.Stat(mdbRebootOwnerPath)
+	ownerHeld := ownerFileErr == nil
+
+	switch decideRebootOwnerAction(mdb, dbc, owner, ownerHeld) {
+	case ownerClear:
+		s.clearRebootOwner()
+	case ownerAdopt:
+		// Gate on the vehicle state exactly like the live awaiter: the
+		// reboot must only fire from stand-by, parked, or shutting-down.
+		state, err := s.client.HGet("vehicle", "state")
+		if err != nil {
+			log.Printf("Keeping MDB reboot ownership: cannot read vehicle state: %v", err)
+			return
+		}
+		if !rebootAllowedVehicleStates[state] {
+			log.Printf("Keeping MDB reboot ownership: vehicle state %q does not allow a reboot; a later restart or UMS cycle can adopt the completed install", state)
+			return
+		}
+		s.clearRebootOwner()
+		if _, err := s.client.LPush("scooter:power", "reboot"); err != nil {
+			log.Printf("Failed to trigger the adopted MDB reboot: %v", err)
+			return
+		}
+		log.Printf("Adopted completed MDB install (pending-reboot) and triggered the MDB reboot")
+	default:
+		log.Printf("Keeping MDB reboot ownership: mdb=%q dbc=%q", mdb, dbc)
+	}
+}
+
+func (s *Service) checkIfDBCNeeded(mountPoint string) (bool, error) {
 	updateDir := filepath.Join(mountPoint, "system-update")
-	if entries, err := os.ReadDir(updateDir); err == nil {
-		for _, entry := range entries {
-			if !entry.IsDir() && update.IsDBCUpdateArtifact(entry.Name()) {
-				log.Println("Found DBC update files, DBC needed")
-				return true
-			}
+	entries, err := readDirWithRetry(updateDir)
+	if err != nil {
+		return false, fmt.Errorf("scan %s: %w", updateDir, err)
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() && update.IsDBCUpdateArtifact(entry.Name()) {
+			log.Println("Found DBC update files, DBC needed")
+			return true, nil
 		}
 	}
 
 	mapsDir := filepath.Join(mountPoint, "maps")
-	if entries, err := os.ReadDir(mapsDir); err == nil {
-		for _, entry := range entries {
-			if !entry.IsDir() {
-				filename := entry.Name()
-				if strings.HasSuffix(filename, ".mbtiles") || maps.IsValhallaTilesArchive(filename) {
-					log.Println("Found map files, DBC needed")
-					return true
-				}
+	entries, err = readDirWithRetry(mapsDir)
+	if err != nil {
+		return false, fmt.Errorf("scan %s: %w", mapsDir, err)
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			filename := entry.Name()
+			if strings.HasSuffix(filename, ".mbtiles") || maps.IsValhallaTilesArchive(filename) {
+				log.Println("Found map files, DBC needed")
+				return true, nil
 			}
 		}
 	}
 
 	dbcScript := filepath.Join(mountPoint, "scripts", "dbc.sh")
-	if _, err := os.Stat(dbcScript); err == nil {
+	if _, err := os.Stat(dbcScript); err != nil && !os.IsNotExist(err) {
+		return false, fmt.Errorf("stat %s: %w", dbcScript, err)
+	} else if err == nil {
 		log.Println("Found DBC script, DBC needed")
-		return true
+		return true, nil
 	}
 
 	log.Println("No DBC operations needed")
-	return false
+	return false, nil
+}
+
+// readDirWithRetry retries a directory listing: the FAT remount right
+// after a UMS detach can briefly serve I/O errors, and a false "no DBC
+// operations needed" here skips the DBC interface enable and later
+// aborts the whole import pass. A directory that genuinely does not
+// exist is an empty listing, not an error; any other error that
+// survives the retries fails the scan so the caller aborts with the
+// staged artifacts intact instead of silently importing nothing.
+func readDirWithRetry(path string) ([]os.DirEntry, error) {
+	var entries []os.DirEntry
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(200 * time.Millisecond)
+		}
+		entries, err = os.ReadDir(path)
+		if err == nil {
+			return entries, nil
+		}
+	}
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	return nil, err
 }
 
 // onDeviceDetached is called from detachLoop when the USB monitor detects
