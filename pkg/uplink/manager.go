@@ -64,7 +64,8 @@ func (m *Manager) CopyToUSB(ctx context.Context, usbMountPath string) error {
 	return nil
 }
 
-// CopyFromUSB returns true if the on-device config changed.
+// CopyFromUSB returns true if the on-device config changed. Reconciliation
+// callers must pass context.Background(); it must not be canceled mid-import.
 func (m *Manager) CopyFromUSB(ctx context.Context, usbMountPath string) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err

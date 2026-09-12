@@ -139,11 +139,22 @@ func copyFile(ctx context.Context, src, dst string) error {
 	}
 	defer in.Close()
 
-	out, err := os.Create(dst)
+	return copyReaderToFile(ctx, in, dst)
+}
+
+func copyReaderToFile(ctx context.Context, in io.Reader, dst string) error {
+	part := dst + ".part"
+	out, err := os.Create(part)
 	if err != nil {
 		return err
 	}
-	defer out.Close()
+	succeeded := false
+	defer func() {
+		_ = out.Close()
+		if !succeeded {
+			_ = os.Remove(part)
+		}
+	}()
 
 	buf := make([]byte, 32*1024)
 	for {
@@ -170,5 +181,18 @@ func copyFile(ctx context.Context, src, dst string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return out.Sync()
+	if err := out.Sync(); err != nil {
+		return err
+	}
+	if err := out.Close(); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := os.Rename(part, dst); err != nil {
+		return err
+	}
+	succeeded = true
+	return nil
 }

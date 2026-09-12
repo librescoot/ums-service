@@ -39,6 +39,9 @@ func NewController(driveFile string) *Controller {
 	}
 }
 
+// SwitchMode deliberately uses uninterruptible commands below: canceling ip,
+// modprobe, or rmmod mid-reconfiguration could leave the USB gadget half
+// configured, so cancellation waits for the switch to finish.
 func (c *Controller) SwitchMode(mode string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()

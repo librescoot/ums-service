@@ -436,6 +436,7 @@ func (s *Service) runUMSOp(op *operation) error {
 		{"Error copying radio-gaga config to USB", func() error { return s.radioGagaMgr.CopyToUSB(op.ctx, mountPoint) }},
 		{"Error preparing uplink-service directory", func() error { return s.uplinkMgr.PrepareUSB(op.ctx, mountPoint) }},
 		{"Error copying uplink-service config to USB", func() error { return s.uplinkMgr.CopyToUSB(op.ctx, mountPoint) }},
+		// onboot export is deliberately short and stays uncancellable.
 		{"Error copying onboot.sh to USB", func() error { return s.onbootMgr.CopyToUSB(mountPoint) }},
 		{"Error preparing log-bundles directory", func() error { return s.logBundlesMgr.PrepareUSB(op.ctx, mountPoint) }},
 		{"Error copying log bundles to USB", func() error { return s.logBundlesMgr.CopyToUSB(op.ctx, mountPoint) }},

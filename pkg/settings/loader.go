@@ -50,6 +50,8 @@ func (l *Loader) CopyToUSB(ctx context.Context, usbMountPath string) error {
 	return nil
 }
 
+// CopyFromUSB reconciles settings from USB. Reconciliation callers must pass
+// context.Background(); it must not be canceled mid-import.
 func (l *Loader) CopyFromUSB(ctx context.Context, usbMountPath string) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err

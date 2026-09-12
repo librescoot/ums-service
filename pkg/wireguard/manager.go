@@ -91,7 +91,8 @@ func (m *Manager) CopyToUSB(ctx context.Context, usbMountPath string) error {
 }
 
 // SyncFromUSB treats the USB wireguard directory as authoritative: local .conf files
-// absent there are removed, including when the directory is empty.
+// absent there are removed, including when the directory is empty. Reconciliation
+// callers must pass context.Background(); it must not be canceled mid-import.
 func (m *Manager) SyncFromUSB(ctx context.Context, usbMountPath string) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err

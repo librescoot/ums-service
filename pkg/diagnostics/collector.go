@@ -48,7 +48,11 @@ func (c *Collector) CollectToUSB(ctx context.Context, mountPoint string) {
 		return
 	}
 
-	if c.dbcReachable(ctx) {
+	dbcReachable := c.dbcReachable(ctx)
+	if ctx.Err() != nil {
+		return
+	}
+	if dbcReachable {
 		dbcDir := filepath.Join(mountPoint, "diagnostics", "dbc")
 		if err := os.MkdirAll(dbcDir, 0755); err != nil {
 			log.Printf("Failed to create DBC diagnostics directory: %v", err)

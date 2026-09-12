@@ -269,7 +269,9 @@ func (m *Manager) replaceCorruptDrive() error {
 
 // verifyFilesystem checks the drive, repairing it or replacing it when that is
 // the only way out. replaced reports that the drive was recreated, so a
-// user-facing caller can say the files on it are gone.
+// user-facing caller can say the files on it are gone. Its fatlabel, mkfs, and
+// fsck commands deliberately remain uninterruptible: cancellation waits rather
+// than risking filesystem corruption from stopping one mid-run.
 func (m *Manager) verifyFilesystem() (replaced bool, err error) {
 	if checkErr := m.checkFilesystem(); checkErr != nil {
 		var unrecoverable *unrecoverableFilesystemError
@@ -300,6 +302,8 @@ func (m *Manager) verifyFilesystem() (replaced bool, err error) {
 	return false, nil
 }
 
+// Mount deliberately remains uninterruptible so cancellation cannot leave the
+// filesystem half-mounted; it waits for the mount command to finish.
 func (m *Manager) Mount() error {
 	replaced, err := m.verifyFilesystem()
 	if err != nil {
@@ -321,6 +325,8 @@ func (m *Manager) Mount() error {
 	return nil
 }
 
+// Unmount deliberately remains uninterruptible so cancellation cannot leave the
+// filesystem half-unmounted; it waits for the unmount command to finish.
 func (m *Manager) Unmount() error {
 	if err := m.unmountDrive(m.mountPoint); err != nil {
 		return fmt.Errorf("failed to unmount drive: %w", err)

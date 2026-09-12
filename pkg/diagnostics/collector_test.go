@@ -117,6 +117,25 @@ func TestModemSectionReportsReadError(t *testing.T) {
 	}
 }
 
+func TestRunDBCCommandTimeoutIsChildOfOperationContext(t *testing.T) {
+	originalCommandContext := commandContext
+	commandContext = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		return exec.CommandContext(ctx, "sh", "-c", "while :; do :; done")
+	}
+	t.Cleanup(func() { commandContext = originalCommandContext })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	_, err := New(nil).runDBCCommand(ctx, "blocked")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("runDBCCommand error = %v, want parent context deadline exceeded", err)
+	}
+	if strings.Contains(err.Error(), "ssh command timed out") {
+		t.Fatalf("runDBCCommand error = %v, want parent timeout to win", err)
+	}
+}
+
 func TestRunDBCCommandCancelsBlockedCommand(t *testing.T) {
 	originalCommandContext := commandContext
 	started := filepath.Join(t.TempDir(), "started")
