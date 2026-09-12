@@ -37,6 +37,19 @@ When the reboot phase finishes, `usb.status` returns to `idle` and the outcome i
 
 The exported drive contains managed areas for `settings.toml`, `wireguard/`, `radio-gaga/`, `uplink-service/`, `onboot.sh`, `system-update/`, `maps/`, `scripts/`, `log-bundles/`, and `diagnostics/`. On return to normal mode, the service copies supported configuration back to its managed locations, processes imports, restarts affected services when configuration changed, cleans the drive, and unmounts it.
 
+Update artifacts placed in `system-update/` are grouped per board (`librescoot-*-mdb-*`, `librescoot-*-dbc-*`) and staged in the canonical location update-service already uses: `/data/ota/mdb` on the MDB, or `/data/ota/dbc` on the DBC. UMS then pushes one path-free command per board, `apply-staged-updates`, to that board's update-service command list; update-service discovers the staged files and resolves what to install.
+
+| Files for one board | Result |
+| --- | --- |
+| one `.mender` or one `.delta` | staged and installed |
+| two or more `.delta` on one channel | staged; update-service resolves the chain and installs it as one image |
+| more than one `.mender`, or a `.mender` together with any `.delta` | refused |
+| deltas spanning more than one channel | refused |
+
+A refused board is skipped without staging anything, while any other board in the same drop is processed normally. A refusal is reported in three places: the journald log, `usb:log`, and the dashboard: `usb.last-result` is set to `error` (so `lsc usb status` shows it) and an `error` notification is published on `scootui:notification`.
+
+update-service owns the final discovery: the running version's base `.mender` sits permanently in that directory and is ignored, a newer `.mender` is installed as a full image, and a delta chain is resolved from the deltas' own metadata and applied as one mender install with one reboot.
+
 Do not remove the virtual drive file or force-unload its gadget module while a host is writing it. Let the host detach and allow the service to complete its processing cycle.
 
 ## Configuration

@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -476,6 +477,9 @@ func (s *Service) switchToNormal(prevMode string) error {
 		log.Printf("Error processing updates: %v", err)
 	} else {
 		logger.Logf("updates", "done")
+	}
+	if err == nil && len(queued.Refused) > 0 {
+		s.reportRefusals(queued.Refused)
 	}
 	logger.ClearProgress()
 
@@ -1023,6 +1027,76 @@ func (s *Service) clearResult() {
 	}, ipc.Sync()); err != nil {
 		log.Printf("Error clearing usb result: %v", err)
 	}
+}
+
+// notificationTTL bounds how long a refusal stays on the dashboard. Within the
+// scootui:notification ingress contract's 1000-60000 ms range.
+const notificationTTL = 30000
+
+// reportRefusals surfaces a refused staged update in the two places the loader
+// cannot reach: usb.last-result so `lsc usb status` shows it, and a dashboard
+// notification on the shared ingress channel. The loader already logged it.
+// Only the refused board is skipped; any other board in the same drop still
+// installs.
+func (s *Service) reportRefusals(refusals []update.Refusal) {
+	parts := make([]string, 0, len(refusals))
+	for _, r := range refusals {
+		parts = append(parts, fmt.Sprintf("%s: %s", strings.ToUpper(r.Board), r.Reason))
+	}
+	detail := strings.Join(parts, "; ")
+	s.setResult(resultError, "%s", detail)
+	s.publishNotification("Update refused", detail)
+}
+
+// publishNotification sends one external notification to the dashboard over the
+// shipped scootui:notification ingress contract. Fire-and-forget: a dashboard
+// that is off or disconnected must not fail a UMS cycle.
+func (s *Service) publishNotification(title, body string) {
+	payload := struct {
+		ID       string `json:"id"`
+		Source   string `json:"source"`
+		Action   string `json:"action"`
+		Title    string `json:"title"`
+		Body     string `json:"body"`
+		Severity string `json:"severity"`
+		TTLms    int    `json:"ttl_ms"`
+	}{
+		ID:       "ums-update-refused",
+		Source:   "ums",
+		Action:   "show",
+		Title:    truncateUTF16(title, 120),
+		Body:     truncateUTF16(body, 512),
+		Severity: "error",
+		TTLms:    notificationTTL,
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("Error encoding notification: %v", err)
+		return
+	}
+	if _, err := s.client.Publish("scootui:notification", string(data), ipc.Sync()); err != nil {
+		log.Printf("Error publishing notification: %v", err)
+	}
+}
+
+// truncateUTF16 cuts s to at most max UTF-16 code units, the ingress
+// contract's limit for title and body.
+func truncateUTF16(s string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	n := 0
+	for i, r := range s {
+		units := 1
+		if r > 0xFFFF {
+			units = 2 // surrogate pair
+		}
+		if n+units > max {
+			return s[:i]
+		}
+		n += units
+	}
+	return s
 }
 
 func (s *Service) setStep(step string) {

@@ -17,21 +17,47 @@ import (
 	"github.com/librescoot/ums-service/pkg/umslog"
 )
 
+// dbcUpdater is the slice of the DBC interface the OTA loader uses. Production
+// passes *dbc.Interface; tests substitute a fake so the multi-file transfer
+// order and the single MarkDBCUpdateQueued handoff are exercised.
+type dbcUpdater interface {
+	IsEnabled() bool
+	RunCommand(ctx context.Context, command string) (string, error)
+	TransferFile(ctx context.Context, localPath, remotePath string, progressCb dbc.ProgressFunc) error
+	MarkDBCUpdateQueued()
+}
+
 type Loader struct {
 	otaRootDir   string
 	otaDir       string
 	dbcOtaDir    string
 	managedDirs  []managedDir
 	client       *ipc.Client
-	dbcInterface *dbc.Interface
+	dbcInterface dbcUpdater
 }
 
-// managedDir is a subdirectory under /data/ota that ums-service is allowed to
-// keep update artifacts in. `keep` is the number of most-recent versions to
-// retain per (channel) group during cleanup.
+// managedDir is a subdirectory under /data/ota that ums-service keeps update
+// artifacts in. `keep` is the number of most-recent versions to retain per
+// (channel) group during cleanup.
+//
+// The otaDir and dbcOtaDir entries are load-bearing even though their pruning
+// is skipped: managedDirs is also the orphan-sweep allowlist
+// (removeOrphanedUpdateFiles deletes any update file whose immediate parent is
+// not listed here), and the staged update artifacts live directly in those
+// two dirs. Removing them would make the next CleanupStaleFiles delete a
+// staged chain out from under an in-flight install. Their `keep` value alone
+// is inert.
 type managedDir struct {
 	path string
 	keep int
+}
+
+// Refusal is one board's staged update that was refused before anything was
+// copied or transferred. The caller surfaces it to the user (usb.last-result
+// and the dashboard notification channel) as well as the ums log.
+type Refusal struct {
+	Board  string // "mdb" or "dbc"
+	Reason string
 }
 
 // Queued summarizes what ProcessUpdates copied/transferred and what still
@@ -42,11 +68,13 @@ type managedDir struct {
 //
 // MDB and DBC indicate whether the respective artifact was staged
 // (file copied or transferred to its target); they do not reflect
-// whether the LPush in PendingPushes completed.
+// whether the LPush in PendingPushes completed. Refused lists boards that
+// were skipped without staging anything.
 type Queued struct {
 	MDB           bool
 	DBC           bool
 	PendingPushes []PendingPush
+	Refused       []Refusal
 }
 
 // PendingPush is an LPush operation deferred so the caller can subscribe
@@ -56,7 +84,7 @@ type PendingPush struct {
 	Value   string
 }
 
-func New(client *ipc.Client, dbcInterface *dbc.Interface) *Loader {
+func New(client *ipc.Client, dbcInterface dbcUpdater) *Loader {
 	otaDir := "/data/ota/mdb"
 	dbcOtaDir := "/data/ota/dbc"
 	return &Loader{
@@ -281,6 +309,12 @@ func (l *Loader) PrepareUSB(usbMountPath string) error {
 	return nil
 }
 
+// stagedUpdateCommand is the path-free command UMS pushes for a staged board.
+// update-service discovers the artifacts in its own component download dir and
+// resolves what to install, so the command carries no paths and there is no
+// separator to parse.
+const stagedUpdateCommand = "apply-staged-updates"
+
 func (l *Loader) ProcessUpdates(ctx context.Context, perFileTimeout time.Duration, logger *umslog.Logger, usbMountPath string) (Queued, error) {
 	var queued Queued
 	updateDir := filepath.Join(usbMountPath, "system-update")
@@ -294,60 +328,137 @@ func (l *Loader) ProcessUpdates(ctx context.Context, perFileTimeout time.Duratio
 		return queued, fmt.Errorf("failed to read update directory: %w", err)
 	}
 
+	byBoard := make(map[string][]string)
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
 		}
-
-		filename := entry.Name()
-		srcPath := filepath.Join(updateDir, filename)
-
-		switch updateArtifactTarget(filename) {
-		case "mdb":
-			push, err := l.processMDBUpdate(logger, srcPath)
-			if err != nil {
-				return queued, fmt.Errorf("failed to process MDB update: %w", err)
-			}
-			queued.MDB = true
-			queued.PendingPushes = append(queued.PendingPushes, push)
-		case "dbc":
-			push, err := l.processDBCUpdate(ctx, perFileTimeout, logger, srcPath)
-			if err != nil {
-				return queued, fmt.Errorf("failed to process DBC update: %w", err)
-			}
-			queued.DBC = true
-			queued.PendingPushes = append(queued.PendingPushes, push)
+		target := updateArtifactTarget(entry.Name())
+		if target == "" {
+			continue
 		}
+		byBoard[target] = append(byBoard[target], filepath.Join(updateDir, entry.Name()))
+	}
+
+	// MDB before DBC, so the order is deterministic regardless of how the
+	// directory happens to iterate.
+	for _, target := range []string{"mdb", "dbc"} {
+		paths := byBoard[target]
+		if len(paths) == 0 {
+			continue
+		}
+
+		plan, reason := planBoardUpdate(target, paths, logger)
+		if reason != "" {
+			queued.Refused = append(queued.Refused, Refusal{Board: target, Reason: reason})
+			continue
+		}
+
+		var push PendingPush
+		var procErr error
+		switch target {
+		case "mdb":
+			push, procErr = l.processMDBUpdate(logger, plan)
+		case "dbc":
+			push, procErr = l.processDBCUpdate(ctx, perFileTimeout, logger, plan)
+		}
+		if procErr != nil {
+			return queued, fmt.Errorf("failed to process %s update: %w", strings.ToUpper(target), procErr)
+		}
+		if target == "mdb" {
+			queued.MDB = true
+		} else {
+			queued.DBC = true
+		}
+		queued.PendingPushes = append(queued.PendingPushes, push)
 	}
 
 	return queued, nil
 }
 
-func (l *Loader) processMDBUpdate(logger *umslog.Logger, srcPath string) (PendingPush, error) {
-	filename := filepath.Base(srcPath)
-	log.Printf("Processing MDB update: %s", filename)
-	if logger != nil {
-		logger.Logf("updates", "copying MDB update %s", filename)
+// planBoardUpdate decides whether one board's files form a drop UMS may stage,
+// returning the files to copy/transfer. reason is non-empty when the board is
+// conflicted and must be skipped without acting on any of its files:
+//
+//   - a full image together with one or more deltas — the board cannot be both
+//     full-updated and delta-updated in one drop;
+//   - more than one full image — it is ambiguous which one to install;
+//   - deltas that span more than one channel/key — a chain cannot cross
+//     channels, and ordering across them is meaningless.
+//
+// The order of the returned paths does not matter: update-service resolves a
+// delta chain from the deltas' own metadata, not from the command.
+func planBoardUpdate(target string, paths []string, logger *umslog.Logger) (plan []string, reason string) {
+	var menders, deltas []string
+	for _, p := range paths {
+		if strings.HasSuffix(p, ".mender") {
+			menders = append(menders, p)
+		} else {
+			deltas = append(deltas, p)
+		}
 	}
 
+	refuse := func(format string, args ...any) ([]string, string) {
+		msg := fmt.Sprintf(format, args...)
+		log.Printf("update: refusing %s update: %s - skipping this board", target, msg)
+		if logger != nil {
+			logger.Error("updates", "refusing %s update: %s - skipping this board", target, msg)
+		}
+		return nil, msg
+	}
+
+	switch {
+	case len(menders) > 0 && len(deltas) > 0:
+		return refuse("%d full image(s) and %d delta(s) staged together; it is ambiguous whether to full-update or delta-update",
+			len(menders), len(deltas))
+	case len(menders) > 1:
+		return refuse("%d full images staged for one board; it is ambiguous which one to install", len(menders))
+	case len(menders) == 1:
+		return menders, ""
+	case len(deltas) == 1:
+		return deltas, ""
+	}
+
+	// Deltas only, and at least two: they must be one chain, so one channel/key.
+	keys := make(map[string]bool, len(deltas))
+	for _, d := range deltas {
+		key, _ := splitVersion(filepath.Base(d))
+		keys[key] = true
+	}
+	if len(keys) > 1 {
+		return refuse("%d deltas span %d channels/keys; a chain must stay on one", len(deltas), len(keys))
+	}
+	return deltas, ""
+}
+
+func (l *Loader) processMDBUpdate(logger *umslog.Logger, srcPaths []string) (PendingPush, error) {
 	if err := os.MkdirAll(l.otaDir, 0755); err != nil {
 		return PendingPush{}, fmt.Errorf("failed to create OTA directory: %w", err)
 	}
 
-	dstPath := filepath.Join(l.otaDir, filename)
+	for _, srcPath := range srcPaths {
+		filename := filepath.Base(srcPath)
+		log.Printf("Processing MDB update: %s", filename)
+		if logger != nil {
+			logger.Logf("updates", "copying MDB update %s", filename)
+		}
 
-	// Copy instead of rename — source is on vfat, destination on ext4
-	if err := copyFile(srcPath, dstPath); err != nil {
-		return PendingPush{}, fmt.Errorf("failed to copy update file: %w", err)
+		dstPath := filepath.Join(l.otaDir, filename)
+
+		// Copy instead of rename — source is on vfat, destination on ext4
+		if err := copyFile(srcPath, dstPath); err != nil {
+			return PendingPush{}, fmt.Errorf("failed to copy update file: %w", err)
+		}
+
+		log.Printf("Successfully staged MDB update: %s", filename)
+		if logger != nil {
+			logger.Logf("updates", "staged MDB update %s -> %s", filename, dstPath)
+		}
 	}
 
-	log.Printf("Successfully staged MDB update: %s", filename)
-	if logger != nil {
-		logger.Logf("updates", "staged MDB update %s -> %s", filename, dstPath)
-	}
 	return PendingPush{
 		Channel: "scooter:update:mdb",
-		Value:   fmt.Sprintf("update-from-file:%s", dstPath),
+		Value:   stagedUpdateCommand,
 	}, nil
 }
 
@@ -371,33 +482,44 @@ func copyFile(src, dst string) error {
 	return out.Sync()
 }
 
-func (l *Loader) processDBCUpdate(ctx context.Context, timeout time.Duration, logger *umslog.Logger, srcPath string) (PendingPush, error) {
-	filename := filepath.Base(srcPath)
-	log.Printf("Processing DBC update: %s", filename)
-
+func (l *Loader) processDBCUpdate(ctx context.Context, timeout time.Duration, logger *umslog.Logger, srcPaths []string) (PendingPush, error) {
 	if !l.dbcInterface.IsEnabled() {
 		return PendingPush{}, fmt.Errorf("DBC interface not enabled for update")
 	}
 
-	opCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	remotePath := filepath.Join(l.dbcOtaDir, filename)
-
-	if _, err := l.dbcInterface.RunCommand(opCtx, fmt.Sprintf("mkdir -p %s", l.dbcOtaDir)); err != nil {
-		return PendingPush{}, fmt.Errorf("failed to create remote OTA directory: %w", err)
+	mkdirCtx, cancelMkdir := context.WithTimeout(ctx, timeout)
+	_, mkdirErr := l.dbcInterface.RunCommand(mkdirCtx, fmt.Sprintf("mkdir -p %s", l.dbcOtaDir))
+	cancelMkdir()
+	if mkdirErr != nil {
+		return PendingPush{}, fmt.Errorf("failed to create remote OTA directory: %w", mkdirErr)
 	}
 
-	var progress dbc.ProgressFunc
-	if logger != nil {
-		progress = logger.ProgressCallback(filename)
-		defer logger.ClearProgress()
-	}
-	if err := l.dbcInterface.TransferFile(opCtx, srcPath, remotePath, progress); err != nil {
-		return PendingPush{}, fmt.Errorf("failed to transfer update to DBC: %w", err)
-	}
+	for _, srcPath := range srcPaths {
+		filename := filepath.Base(srcPath)
+		log.Printf("Processing DBC update: %s", filename)
 
-	log.Printf("Copied DBC update to %s", remotePath)
+		// One timeout per file: a chain is several transfers, not one long one.
+		fileCtx, cancel := context.WithTimeout(ctx, timeout)
+		var progress dbc.ProgressFunc
+		if logger != nil {
+			progress = logger.ProgressCallback(filename)
+		}
+		remotePath := filepath.Join(l.dbcOtaDir, filename)
+		transferErr := l.dbcInterface.TransferFile(fileCtx, srcPath, remotePath, progress)
+		cancel()
+		if logger != nil {
+			logger.ClearProgress()
+		}
+		if transferErr != nil {
+			return PendingPush{}, fmt.Errorf("failed to transfer update to DBC: %w", transferErr)
+		}
+
+		log.Printf("Copied DBC update to %s", remotePath)
+		log.Printf("Successfully staged DBC update: %s", filename)
+		if logger != nil {
+			logger.Logf("updates", "staged DBC update %s -> %s", filename, remotePath)
+		}
+	}
 
 	// Tell the dbc.Interface to leave the vehicle-service update lock
 	// held after Disable(). update-service runs the actual mender
@@ -407,12 +529,8 @@ func (l *Loader) processDBCUpdate(ctx context.Context, timeout time.Duration, lo
 	// power before the installation finishes.
 	l.dbcInterface.MarkDBCUpdateQueued()
 
-	log.Printf("Successfully staged DBC update: %s", filename)
-	if logger != nil {
-		logger.Logf("updates", "staged DBC update %s -> %s", filename, remotePath)
-	}
 	return PendingPush{
 		Channel: "scooter:update:dbc",
-		Value:   fmt.Sprintf("update-from-file:%s", remotePath),
+		Value:   stagedUpdateCommand,
 	}, nil
 }

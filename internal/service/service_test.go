@@ -202,3 +202,28 @@ func TestCheckIfDBCNeeded_UnreadableDirectoryFails(t *testing.T) {
 		t.Fatal("checkIfDBCNeeded() succeeded on an unreadable system-update directory")
 	}
 }
+
+// TestTruncateUTF16 pins the notification ingress limits: title <= 120 and
+// body <= 512 UTF-16 code units, counted so an astral character is two.
+func TestTruncateUTF16(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		max  int
+		want string
+	}{
+		{"shorter than cap", "abc", 5, "abc"},
+		{"exactly at cap", "abcde", 5, "abcde"},
+		{"cut at cap", "abcdef", 5, "abcde"},
+		{"astral character counts as two", "a\U0001F600b", 2, "a"},
+		{"astral character fits", "a\U0001F600b", 3, "a\U0001F600"},
+		{"zero cap", "abc", 0, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := truncateUTF16(tc.in, tc.max); got != tc.want {
+				t.Errorf("truncateUTF16(%q, %d) = %q, want %q", tc.in, tc.max, got, tc.want)
+			}
+		})
+	}
+}
