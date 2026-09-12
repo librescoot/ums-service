@@ -722,6 +722,14 @@ func (s *Service) awaitInstallsAndReboot(ctx context.Context, queued update.Queu
 		return
 	}
 
+	// Nothing installed on the MDB, so there is nothing to reboot into.
+	if !update.MDBRebootNeeded(queued, rec) {
+		setResult(resultNothingToInstall, "staged updates resolved to nothing applicable; nothing installed")
+		logger.Logf("reboot", "no MDB install to reboot into; finishing without a reboot")
+		log.Println("awaiter: no MDB install to reboot into; finishing without a reboot")
+		return
+	}
+
 	s.setStep("waiting-vehicle-state")
 
 	state, err := s.client.HGet("vehicle", "state")
@@ -793,12 +801,13 @@ func decideRebootOwnerAction(mdb, dbc, owner string, ownerHeld bool) ownerAction
 		}
 	case mdb == "downloading" || mdb == "preparing" || mdb == "installing":
 		return ownerKeep
-	case mdb == "" || mdb == "idle" || mdb == "error":
+	case mdb == "" || mdb == "idle" || mdb == "error" || mdb == "staged-noop":
 		if dbc == "downloading" || dbc == "preparing" || dbc == "installing" || dbc == "pending-reboot" {
 			// A DBC install may still be activating; keep the fail-safe
 			// claim until it settles.
 			return ownerKeep
 		}
+		// A staged no-op leaves nothing installed, so the claim is settled.
 		return ownerClear
 	default:
 		return ownerKeep
@@ -1019,11 +1028,12 @@ func (s *Service) setStatus(status string) {
 }
 
 const (
-	resultRebootTriggered = "reboot-triggered"
-	resultTimeout         = "timeout"
-	resultInstallError    = "install-error"
-	resultVehicleState    = "vehicle-state"
-	resultError           = "error"
+	resultRebootTriggered  = "reboot-triggered"
+	resultTimeout          = "timeout"
+	resultInstallError     = "install-error"
+	resultVehicleState     = "vehicle-state"
+	resultError            = "error"
+	resultNothingToInstall = "nothing-to-install"
 )
 
 func (s *Service) setResult(result, format string, args ...any) {

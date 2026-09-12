@@ -759,6 +759,68 @@ func TestRecordingSourceTracksHistory(t *testing.T) {
 	}
 }
 
+// A staged no-op is terminal: the wait must return at once rather than sitting
+// out the liveness window and reporting a timeout.
+func TestWaitForCompletion_StagedNoopCompletesImmediately(t *testing.T) {
+	src := newFakeOTASource(map[string]string{"mdb": "idle"})
+	q := Queued{MDB: true}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- WaitForCompletion(context.Background(), src, q, 30*time.Second, time.Minute, nil)
+	}()
+
+	src.push("mdb", "installing")
+	src.push("mdb", "staged-noop")
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("WaitForCompletion() = %v, want nil", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("wait did not finish on staged-noop")
+	}
+}
+
+// A no-op must not request a reboot: nothing was installed, so there is nothing
+// to reboot into.
+func TestMDBRebootNeededAfterWait(t *testing.T) {
+	cases := []struct {
+		name  string
+		final string
+		want  bool
+	}{
+		{"install reached pending-reboot", "pending-reboot", true},
+		{"staged no-op", "staged-noop", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			src := newFakeOTASource(map[string]string{"mdb": "idle"})
+			rec := NewRecordingSource(src)
+			defer rec.Stop()
+			q := Queued{MDB: true}
+
+			done := make(chan error, 1)
+			go func() {
+				done <- WaitForCompletion(context.Background(), rec, q, 2*time.Second, 10*time.Second, nil)
+			}()
+			src.push("mdb", "installing")
+			src.push("mdb", tc.final)
+
+			if err := <-done; err != nil {
+				t.Fatalf("WaitForCompletion() = %v, want nil", err)
+			}
+			if got := MDBRebootNeeded(q, rec); got != tc.want {
+				t.Fatalf("MDBRebootNeeded() = %v, want %v", got, tc.want)
+			}
+			if MDBRebootNeeded(Queued{DBC: true}, rec) {
+				t.Fatal("MDBRebootNeeded() = true with the MDB not queued")
+			}
+		})
+	}
+}
+
 func TestInstallRecovered(t *testing.T) {
 	t.Run("DBC recovered", func(t *testing.T) {
 		src := newFakeOTASource(map[string]string{"dbc": "idle"})

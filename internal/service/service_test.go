@@ -88,6 +88,22 @@ func TestDecideRebootOwnerAction(t *testing.T) {
 			ownerHeld: true,
 			want:      ownerKeep,
 		},
+		{
+			name:      "staged no-op is settled",
+			mdb:       "staged-noop",
+			dbc:       "idle",
+			owner:     "ums",
+			ownerHeld: true,
+			want:      ownerClear,
+		},
+		{
+			name:      "staged no-op MDB, DBC still activating",
+			mdb:       "staged-noop",
+			dbc:       "installing",
+			owner:     "ums",
+			ownerHeld: true,
+			want:      ownerKeep,
+		},
 	}
 
 	for _, tt := range tests {

@@ -11,7 +11,9 @@ import (
 const (
 	statusIdle          = "idle"
 	statusPendingReboot = "pending-reboot"
-	statusError         = "error"
+	// statusStagedNoop: update-service found nothing applicable to install.
+	statusStagedNoop = "staged-noop"
+	statusError      = "error"
 )
 
 // ErrorSettleDuration is how long a watched component must remain in
@@ -91,6 +93,7 @@ func installInProgress(source OTAStatusSource, components []string) bool {
 				return true
 			}
 		}
+		// statusStagedNoop deliberately falls through: it is not install activity.
 	}
 	return false
 }
@@ -252,6 +255,16 @@ func WaitForCompletion(ctx context.Context, source OTAStatusSource, q Queued, wi
 				continue
 			}
 			switch u.Status {
+			case statusStagedNoop:
+				st.errorAt = time.Time{}
+				st.sawNonPendingReboot = true
+				if !st.done {
+					st.done = true
+					if allDone(states) {
+						return nil
+					}
+					notify()
+				}
 			case statusPendingReboot:
 				st.errorAt = time.Time{}
 				if st.sawNonPendingReboot && !st.done {
@@ -296,6 +309,11 @@ func WaitForCompletion(ctx context.Context, source OTAStatusSource, q Queued, wi
 			}
 		}
 	}
+}
+
+// MDBRebootNeeded reports whether a queued MDB install reached pending-reboot.
+func MDBRebootNeeded(q Queued, rec *RecordingSource) bool {
+	return q.MDB && rec != nil && rec.Last("mdb") == statusPendingReboot
 }
 
 // RequiredComponents returns queued components in stable order.
