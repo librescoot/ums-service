@@ -131,6 +131,93 @@ func TestRequestModeLeavesStableStateAlone(t *testing.T) {
 	}
 }
 
+func TestRequestModeUsesAchievedUMSVariant(t *testing.T) {
+	t.Run("same variant is a no-op", func(t *testing.T) {
+		done := make(chan struct{})
+		close(done)
+		stable := &operation{
+			target: "ums",
+			ctx:    context.Background(),
+			cancel: func() {},
+			done:   done,
+		}
+		service := &Service{
+			serviceCtx:  context.Background(),
+			currentOp:   stable,
+			umsModeType: "ums",
+		}
+
+		service.requestMode("ums")
+
+		service.mu.Lock()
+		current := service.currentOp
+		service.mu.Unlock()
+		if current != stable {
+			t.Fatal("achieved UMS operation was replaced by the same variant")
+		}
+	})
+
+	t.Run("different variant is re-prepared", func(t *testing.T) {
+		done := make(chan struct{})
+		close(done)
+		stable := &operation{
+			target: "ums",
+			ctx:    context.Background(),
+			cancel: func() {},
+			done:   done,
+		}
+		serviceCtx, stopService := context.WithCancel(context.Background())
+		stopService()
+		service := &Service{
+			serviceCtx:  serviceCtx,
+			currentOp:   stable,
+			umsModeType: "ums",
+		}
+
+		service.requestMode("ums-by-dbc")
+
+		service.mu.Lock()
+		current := service.currentOp
+		service.mu.Unlock()
+		if current == stable || current.target != "ums-by-dbc" {
+			t.Fatalf("current operation = %#v, want fresh ums-by-dbc preparation", current)
+		}
+		select {
+		case <-current.done:
+		case <-time.After(time.Second):
+			t.Fatal("fresh UMS variant preparation did not finish")
+		}
+	})
+}
+
+func TestRequestModeCancelsRebootWatcherBeforeCancelledUMSOpRuns(t *testing.T) {
+	serviceCtx, stopService := context.WithCancel(context.Background())
+	stopService()
+	watcherCancelled := make(chan struct{})
+	service := &Service{
+		serviceCtx: serviceCtx,
+		rebootWatcher: func() {
+			close(watcherCancelled)
+		},
+	}
+
+	service.requestMode("ums")
+
+	select {
+	case <-watcherCancelled:
+	case <-time.After(time.Second):
+		t.Fatal("installing UMS did not cancel the pending reboot watcher")
+	}
+	service.mu.Lock()
+	current := service.currentOp
+	service.mu.Unlock()
+	select {
+	case <-current.done:
+	case <-time.After(time.Second):
+		t.Fatal("immediately cancelled UMS operation did not finish")
+	}
+}
+
 func TestRequestModeWaitsForUnmountBeforeReplacement(t *testing.T) {
 	serviceCtx, stopService := context.WithCancel(context.Background())
 	stopService()
@@ -244,6 +331,11 @@ func TestCancelledOperationTerminalWritesLeaveIdlePublished(t *testing.T) {
 }
 
 func TestUMSActiveOrPreparingIncludesPrepAndFailedExit(t *testing.T) {
+	normal := &Service{}
+	if target, active := normal.umsActiveOrPreparing(); active || target != "" {
+		t.Fatalf("stable normal active,target = %v,%q, want false,empty", active, target)
+	}
+
 	prepCtx, cancelPrep := context.WithCancel(context.Background())
 	preparing := &Service{currentOp: &operation{
 		target: "ums-by-dbc",

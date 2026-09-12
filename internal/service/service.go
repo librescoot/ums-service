@@ -323,7 +323,7 @@ func (s *Service) requestMode(target string) {
 	if current != nil && !currentDone {
 		current.cancel()
 		oldDone = current.done
-		publishIdle = target == "normal" && isUMSTarget(current.target)
+		publishIdle = target == "normal" && isUMSTarget(current.target) && s.umsModeType == ""
 	}
 	s.mu.Unlock()
 
@@ -416,6 +416,9 @@ func (s *Service) runUMSOp(op *operation) error {
 	}
 	mounted = true
 	mountPoint := s.diskMgr.GetMountPoint()
+	// Recompute after any previous operation has finished so its achieved mode
+	// determines whether stale files must be discarded.
+	discardStale := enteringUMSFromNormal(s.usbCtrl.GetCurrentMode())
 
 	type prepStep struct {
 		errorLog string
@@ -424,7 +427,7 @@ func (s *Service) runUMSOp(op *operation) error {
 	steps := []prepStep{
 		{"Error copying settings to USB", func() error { return s.settingsLdr.CopyToUSB(mountPoint) }},
 		{"Error preparing update directory", func() error {
-			return s.updateLdr.PrepareUSB(mountPoint, enteringUMSFromNormal(s.usbCtrl.GetCurrentMode()), umslog.New(s.client))
+			return s.updateLdr.PrepareUSB(mountPoint, discardStale, umslog.New(s.client))
 		}},
 		{"Error preparing maps directory", func() error { return s.mapsUpdater.PrepareUSB(mountPoint) }},
 		{"Error preparing wireguard directory", func() error { return s.wgManager.PrepareUSB(mountPoint) }},
@@ -436,7 +439,7 @@ func (s *Service) runUMSOp(op *operation) error {
 		{"Error copying onboot.sh to USB", func() error { return s.onbootMgr.CopyToUSB(mountPoint) }},
 		{"Error preparing log-bundles directory", func() error { return s.logBundlesMgr.PrepareUSB(mountPoint) }},
 		{"Error copying log bundles to USB", func() error { return s.logBundlesMgr.CopyToUSB(mountPoint) }},
-		{"", func() error { s.diagnostics.CollectToUSB(mountPoint); return nil }},
+		{"Error collecting diagnostics to USB", func() error { s.diagnostics.CollectToUSB(mountPoint); return nil }},
 		{"Error preparing scripts directory", func() error { return s.scriptRunner.PrepareUSB(mountPoint) }},
 	}
 	for _, step := range steps {
@@ -493,11 +496,11 @@ func (s *Service) runNormalOp(op *operation) error {
 func (s *Service) runSwitchToNormal(prevMode string) error {
 	s.setLEDs(ledsOff)
 
+	s.mu.Lock()
 	if err := s.usbCtrl.SwitchMode("normal"); err != nil {
+		s.mu.Unlock()
 		return fmt.Errorf("failed to switch to normal mode: %w", err)
 	}
-
-	s.mu.Lock()
 	s.umsModeType = ""
 	s.mu.Unlock()
 
@@ -1053,7 +1056,7 @@ func readDirWithRetry(path string) ([]os.DirEntry, error) {
 func (s *Service) onDeviceDetached() {
 	s.mu.Lock()
 	target, active := s.umsActiveOrPreparingLocked()
-	if !active {
+	if s.usbCtrl.GetCurrentMode() != "ums" || !active {
 		s.mu.Unlock()
 		return
 	}
@@ -1073,9 +1076,6 @@ func (s *Service) onDeviceDetached() {
 			return
 		}
 		log.Println("ums-by-dbc mode: second disconnect, switching to normal")
-		s.doSwitchToNormal()
-	default:
-		log.Printf("Unknown UMS mode type %q, switching to normal", target)
 		s.doSwitchToNormal()
 	}
 }
