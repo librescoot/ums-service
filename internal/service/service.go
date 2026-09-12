@@ -583,10 +583,12 @@ func (s *Service) awaitInstallsAndReboot(ctx context.Context, queued update.Queu
 		s.setResult(resultError, "could not watch the ota hash: %v", err)
 		return
 	}
-	defer source.Stop()
 	// Recording keeps the observed status history so a failed wait can
 	// be re-checked against what actually happened (InstallRecovered).
 	rec := update.NewRecordingSource(source)
+	// rec.Stop closes the recording pump and forwards to source.Stop,
+	// so both exit at the end of every cycle.
+	defer rec.Stop()
 
 	// update-service normally owns MDB reboot scheduling. Claim it before
 	// publishing install requests so combined imports cannot reboot the MDB
@@ -800,6 +802,12 @@ func (s *Service) reconcileRebootOwner(ota map[string]string) {
 	ownerHeld := ownerFileErr == nil
 
 	switch decideRebootOwnerAction(mdb, dbc, owner, ownerHeld) {
+	case ownerKeep:
+		if !ownerHeld && owner != "ums" {
+			// Nothing was ever claimed here; nothing to keep or log.
+			return
+		}
+		log.Printf("Keeping MDB reboot ownership: mdb=%q dbc=%q", mdb, dbc)
 	case ownerClear:
 		s.clearRebootOwner()
 	case ownerAdopt:
@@ -814,14 +822,16 @@ func (s *Service) reconcileRebootOwner(ota map[string]string) {
 			log.Printf("Keeping MDB reboot ownership: vehicle state %q does not allow a reboot; a later restart or UMS cycle can adopt the completed install", state)
 			return
 		}
-		s.clearRebootOwner()
+		// Push the reboot before releasing the claim: a failed push must
+		// not hand ownership back to update-service while the MDB still
+		// sits at pending-reboot. A claim that lingers after a successful
+		// push self-heals at the next restart (the install is then idle).
 		if _, err := s.client.LPush("scooter:power", "reboot"); err != nil {
 			log.Printf("Failed to trigger the adopted MDB reboot: %v", err)
 			return
 		}
+		s.clearRebootOwner()
 		log.Printf("Adopted completed MDB install (pending-reboot) and triggered the MDB reboot")
-	default:
-		log.Printf("Keeping MDB reboot ownership: mdb=%q dbc=%q", mdb, dbc)
 	}
 }
 
