@@ -93,6 +93,8 @@ type Service struct {
 	mu            sync.Mutex // protects currentOp, detach state, and reboot state
 	currentOp     *operation
 	detachCount   int
+	// umsModeType is the achieved UMS state: it is set only after a successful
+	// UMS attach and cleared immediately after a successful switch back.
 	umsModeType   string
 	serviceCtx    context.Context    // set in Run; parent for operation and reboot goroutines
 	rebootWatcher context.CancelFunc // cancel pending reboot goroutine; nil if none
@@ -258,10 +260,11 @@ func (s *Service) detachLoop(ctx context.Context) {
 
 func (s *Service) handleModeChange(mode string) error {
 	switch mode {
-	case "ums", "ums-by-dbc":
-		return s.switchToUMS(mode, enteringUMSFromNormal(s.usbCtrl.GetCurrentMode()))
-	case "normal":
-		return s.switchToNormal(s.usbCtrl.GetCurrentMode())
+	case "ums", "ums-by-dbc", "normal":
+		// Mode changes run asynchronously; transition failures are logged by
+		// runOperation rather than returned to the hash watcher.
+		s.requestMode(mode)
+		return nil
 	default:
 		prevMode := s.usbCtrl.GetCurrentMode()
 		s.setResult(resultError, "rejected unsupported USB mode %q; remaining in %s", mode, prevMode)
@@ -306,15 +309,12 @@ func (s *Service) requestMode(target string) {
 	s.mu.Lock()
 	current := s.currentOp
 	currentDone := opDone(current)
-	if current != nil && current.target == target {
+	if current != nil && !currentDone && current.target == target {
 		s.mu.Unlock()
 		return
 	}
-	if current != nil && currentDone && isUMSTarget(current.target) && isUMSTarget(target) {
-		current.target = target
-		s.umsModeType = target
+	if current != nil && currentDone && s.modeReachedLocked(target) {
 		s.mu.Unlock()
-		log.Printf("UMS variant changed to %s", target)
 		return
 	}
 
@@ -342,9 +342,22 @@ func (s *Service) requestMode(target string) {
 		done:   make(chan struct{}),
 	}
 	s.mu.Lock()
+	if isUMSTarget(target) && s.rebootWatcher != nil {
+		log.Println("Cancelling pending reboot watcher (re-entering UMS)")
+		s.rebootWatcher()
+	}
 	s.currentOp = op
 	s.mu.Unlock()
 	go s.runOperation(op)
+}
+
+// modeReachedLocked reports whether the gadget has achieved target. Callers
+// hold s.mu; operation targets are intent and are not proof of success.
+func (s *Service) modeReachedLocked(target string) bool {
+	if target == "normal" {
+		return s.umsModeType == ""
+	}
+	return s.umsModeType == target
 }
 
 func (s *Service) runOperation(op *operation) {
@@ -367,15 +380,6 @@ func (s *Service) runOperation(op *operation) {
 	}
 }
 
-// switchToUMS remains the synchronous-call-site wrapper while transitions are
-// dispatched asynchronously. discardStale is recomputed by runUMSOp after any
-// previous operation has finished.
-func (s *Service) switchToUMS(mode string, discardStale bool) error {
-	_ = discardStale
-	s.requestMode(mode)
-	return nil
-}
-
 func (s *Service) runUMSOp(op *operation) error {
 	mounted := false
 	defer func() {
@@ -392,10 +396,6 @@ func (s *Service) runUMSOp(op *operation) error {
 		s.mu.Unlock()
 		return nil
 	}
-	if s.rebootWatcher != nil {
-		log.Println("Cancelling pending reboot watcher (re-entering UMS)")
-		s.rebootWatcher()
-	}
 	// Serialize status publication with cancellation so a cancelled prep
 	// cannot overwrite the dispatcher's immediate idle publication.
 	s.setStatus("preparing")
@@ -409,9 +409,7 @@ func (s *Service) runUMSOp(op *operation) error {
 		return nil
 	}
 	if err := s.diskMgr.Mount(); err != nil {
-		if !cancelled() {
-			s.setResult(resultError, "could not prepare the USB drive: %v", err)
-			s.setStatus("idle")
+		if s.publishUMSFailureIfActive(op, "could not prepare the USB drive: %v", err) {
 			return fmt.Errorf("failed to mount drive: %w", err)
 		}
 		return nil
@@ -420,33 +418,33 @@ func (s *Service) runUMSOp(op *operation) error {
 	mountPoint := s.diskMgr.GetMountPoint()
 
 	type prepStep struct {
-		name string
-		run  func() error
+		errorLog string
+		run      func() error
 	}
 	steps := []prepStep{
-		{"settings", func() error { return s.settingsLdr.CopyToUSB(mountPoint) }},
-		{"updates", func() error {
+		{"Error copying settings to USB", func() error { return s.settingsLdr.CopyToUSB(mountPoint) }},
+		{"Error preparing update directory", func() error {
 			return s.updateLdr.PrepareUSB(mountPoint, enteringUMSFromNormal(s.usbCtrl.GetCurrentMode()), umslog.New(s.client))
 		}},
-		{"maps", func() error { return s.mapsUpdater.PrepareUSB(mountPoint) }},
-		{"wireguard directory", func() error { return s.wgManager.PrepareUSB(mountPoint) }},
-		{"wireguard configs", func() error { return s.wgManager.CopyToUSB(mountPoint) }},
-		{"radio-gaga directory", func() error { return s.radioGagaMgr.PrepareUSB(mountPoint) }},
-		{"radio-gaga config", func() error { return s.radioGagaMgr.CopyToUSB(mountPoint) }},
-		{"uplink-service directory", func() error { return s.uplinkMgr.PrepareUSB(mountPoint) }},
-		{"uplink-service config", func() error { return s.uplinkMgr.CopyToUSB(mountPoint) }},
-		{"onboot", func() error { return s.onbootMgr.CopyToUSB(mountPoint) }},
-		{"log-bundles directory", func() error { return s.logBundlesMgr.PrepareUSB(mountPoint) }},
-		{"log bundles", func() error { return s.logBundlesMgr.CopyToUSB(mountPoint) }},
-		{"diagnostics", func() error { s.diagnostics.CollectToUSB(mountPoint); return nil }},
-		{"scripts", func() error { return s.scriptRunner.PrepareUSB(mountPoint) }},
+		{"Error preparing maps directory", func() error { return s.mapsUpdater.PrepareUSB(mountPoint) }},
+		{"Error preparing wireguard directory", func() error { return s.wgManager.PrepareUSB(mountPoint) }},
+		{"Error copying wireguard configs to USB", func() error { return s.wgManager.CopyToUSB(mountPoint) }},
+		{"Error preparing radio-gaga directory", func() error { return s.radioGagaMgr.PrepareUSB(mountPoint) }},
+		{"Error copying radio-gaga config to USB", func() error { return s.radioGagaMgr.CopyToUSB(mountPoint) }},
+		{"Error preparing uplink-service directory", func() error { return s.uplinkMgr.PrepareUSB(mountPoint) }},
+		{"Error copying uplink-service config to USB", func() error { return s.uplinkMgr.CopyToUSB(mountPoint) }},
+		{"Error copying onboot.sh to USB", func() error { return s.onbootMgr.CopyToUSB(mountPoint) }},
+		{"Error preparing log-bundles directory", func() error { return s.logBundlesMgr.PrepareUSB(mountPoint) }},
+		{"Error copying log bundles to USB", func() error { return s.logBundlesMgr.CopyToUSB(mountPoint) }},
+		{"", func() error { s.diagnostics.CollectToUSB(mountPoint); return nil }},
+		{"Error preparing scripts directory", func() error { return s.scriptRunner.PrepareUSB(mountPoint) }},
 	}
 	for _, step := range steps {
 		if cancelled() {
 			return nil
 		}
 		if err := step.run(); err != nil && !cancelled() {
-			log.Printf("Error preparing %s: %v", step.name, err)
+			log.Printf("%s: %v", step.errorLog, err)
 		}
 	}
 
@@ -454,8 +452,7 @@ func (s *Service) runUMSOp(op *operation) error {
 		return nil
 	}
 	if err := s.diskMgr.Unmount(); err != nil {
-		if !cancelled() {
-			s.setStatus("idle")
+		if s.publishUMSIdleIfActive(op) {
 			return fmt.Errorf("failed to unmount drive: %w", err)
 		}
 		return nil
@@ -489,14 +486,6 @@ func (s *Service) runUMSOp(op *operation) error {
 	return nil
 }
 
-// switchToNormal remains the synchronous-call-site wrapper while transitions
-// are dispatched asynchronously.
-func (s *Service) switchToNormal(prevMode string) error {
-	_ = prevMode
-	s.requestMode("normal")
-	return nil
-}
-
 func (s *Service) runNormalOp(op *operation) error {
 	return s.runSwitchToNormal(s.usbCtrl.GetCurrentMode())
 }
@@ -507,6 +496,10 @@ func (s *Service) runSwitchToNormal(prevMode string) error {
 	if err := s.usbCtrl.SwitchMode("normal"); err != nil {
 		return fmt.Errorf("failed to switch to normal mode: %w", err)
 	}
+
+	s.mu.Lock()
+	s.umsModeType = ""
+	s.mu.Unlock()
 
 	if prevMode != "ums" {
 		s.setStep("")
@@ -662,9 +655,6 @@ func (s *Service) runSwitchToNormal(prevMode string) error {
 		}
 	}
 
-	s.mu.Lock()
-	s.umsModeType = ""
-	s.mu.Unlock()
 	s.setStep("")
 
 	if err == nil && (queued.MDB || queued.DBC) {
@@ -706,8 +696,8 @@ func (s *Service) awaitInstallsAndReboot(ctx context.Context, queued update.Queu
 			return
 		}
 		s.rebootWatcher = nil
-		// If we were cancelled externally, whoever cancelled us
-		// (switchToUMS) already owns the status field; don't clobber.
+		// If we were cancelled externally, requestMode already owns the
+		// status field; don't clobber it.
 		if ctx.Err() == nil {
 			s.setStep("")
 			s.setStatus("idle")
@@ -1062,14 +1052,13 @@ func readDirWithRetry(path string) ([]os.DirEntry, error) {
 // the ums-by-dbc mode which requires two disconnects before switching back.
 func (s *Service) onDeviceDetached() {
 	s.mu.Lock()
-	current := s.currentOp
-	if s.usbCtrl.GetCurrentMode() != "ums" || current == nil || !isUMSTarget(current.target) {
+	target, active := s.umsActiveOrPreparingLocked()
+	if !active {
 		s.mu.Unlock()
 		return
 	}
 	s.detachCount++
 	count := s.detachCount
-	target := current.target
 	s.mu.Unlock()
 
 	log.Printf("USB detach #%d detected (mode type: %s)", count, target)
@@ -1089,6 +1078,24 @@ func (s *Service) onDeviceDetached() {
 		log.Printf("Unknown UMS mode type %q, switching to normal", target)
 		s.doSwitchToNormal()
 	}
+}
+
+// umsActiveOrPreparingLocked returns the achieved UMS variant, or an in-flight
+// entry target before UMS has attached. Callers hold s.mu.
+func (s *Service) umsActiveOrPreparingLocked() (string, bool) {
+	if s.umsModeType != "" {
+		return s.umsModeType, true
+	}
+	if current := s.currentOp; current != nil && !opDone(current) && isUMSTarget(current.target) {
+		return current.target, true
+	}
+	return "", false
+}
+
+func (s *Service) umsActiveOrPreparing() (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.umsActiveOrPreparingLocked()
 }
 
 // doSwitchToNormal preserves the existing callers while routing the exit
@@ -1155,6 +1162,29 @@ func (s *Service) publishIdle() {
 	}, ipc.Sync()); err != nil {
 		log.Printf("Error publishing idle USB status: %v", err)
 	}
+}
+
+// publishUMSFailureIfActive serializes a terminal prep failure with
+// cancellation so it cannot overwrite the dispatcher's idle publication.
+func (s *Service) publishUMSFailureIfActive(op *operation, format string, args ...any) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if op.ctx.Err() != nil {
+		return false
+	}
+	s.setResult(resultError, format, args...)
+	s.setStatus("idle")
+	return true
+}
+
+func (s *Service) publishUMSIdleIfActive(op *operation) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if op.ctx.Err() != nil {
+		return false
+	}
+	s.setStatus("idle")
+	return true
 }
 
 const (

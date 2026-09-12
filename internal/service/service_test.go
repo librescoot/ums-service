@@ -74,6 +74,38 @@ func TestRequestModeCancelsAndSupersedesInFlightPrep(t *testing.T) {
 	}
 }
 
+func TestRequestModeRetriesCompletedFailedUMSEntry(t *testing.T) {
+	for _, target := range []string{"ums", "ums-by-dbc"} {
+		t.Run(target, func(t *testing.T) {
+			done := make(chan struct{})
+			close(done)
+			failed := &operation{
+				target: "ums",
+				ctx:    context.Background(),
+				cancel: func() {},
+				done:   done,
+			}
+			serviceCtx, stopService := context.WithCancel(context.Background())
+			stopService()
+			service := &Service{serviceCtx: serviceCtx, currentOp: failed}
+
+			service.requestMode(target)
+
+			service.mu.Lock()
+			current := service.currentOp
+			service.mu.Unlock()
+			if current == failed || current.target != target {
+				t.Fatalf("current operation = %#v, want fresh %s retry", current, target)
+			}
+			select {
+			case <-current.done:
+			case <-time.After(time.Second):
+				t.Fatal("fresh retry operation did not run")
+			}
+		})
+	}
+}
+
 func TestRequestModeLeavesStableStateAlone(t *testing.T) {
 	done := make(chan struct{})
 	close(done)
@@ -96,6 +128,40 @@ func TestRequestModeLeavesStableStateAlone(t *testing.T) {
 	service.mu.Unlock()
 	if current != stable {
 		t.Fatal("stable operation was replaced")
+	}
+}
+
+func TestRequestModeWaitsForUnmountBeforeReplacement(t *testing.T) {
+	serviceCtx, stopService := context.WithCancel(context.Background())
+	stopService()
+	prepCtx, cancelPrep := context.WithCancel(context.Background())
+	prep := &operation{target: "ums", ctx: prepCtx, cancel: cancelPrep, done: make(chan struct{})}
+	service := &Service{
+		serviceCtx: serviceCtx,
+		currentOp:  prep,
+		publisher:  &testPublisher{setMany: make(chan map[string]any, 1)},
+	}
+	unmounted := make(chan struct{})
+
+	go func() {
+		<-prepCtx.Done()
+		// This models runUMSOp's deferred unmount, which completes before
+		// runOperation closes done.
+		close(unmounted)
+		close(prep.done)
+	}()
+
+	service.requestMode("normal")
+	select {
+	case <-unmounted:
+	default:
+		t.Fatal("replacement started before cancelled prep unmounted")
+	}
+	service.mu.Lock()
+	current := service.currentOp
+	service.mu.Unlock()
+	if current == prep || current.target != "normal" {
+		t.Fatalf("current operation = %#v, want normal replacement", current)
 	}
 }
 
@@ -132,6 +198,73 @@ func TestRequestModeCancellationPublishesIdle(t *testing.T) {
 	case <-returned:
 	case <-time.After(time.Second):
 		t.Fatal("normal request did not complete after teardown")
+	}
+}
+
+func TestCancelledOperationTerminalWritesLeaveIdlePublished(t *testing.T) {
+	serviceCtx, stopService := context.WithCancel(context.Background())
+	stopService()
+	prepCtx, cancelPrep := context.WithCancel(context.Background())
+	prep := &operation{target: "ums", ctx: prepCtx, cancel: cancelPrep, done: make(chan struct{})}
+	publisher := &testPublisher{setMany: make(chan map[string]any, 2)}
+	service := &Service{serviceCtx: serviceCtx, currentOp: prep, publisher: publisher}
+
+	returned := make(chan struct{})
+	go func() {
+		service.requestMode("normal")
+		close(returned)
+	}()
+	select {
+	case <-prepCtx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("normal request did not cancel UMS preparation")
+	}
+	select {
+	case fields := <-publisher.setMany:
+		if fields["status"] != "idle" || fields["step"] != "" {
+			t.Fatalf("idle publication = %#v, want idle with cleared step", fields)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cancelling prep did not publish idle")
+	}
+	if service.publishUMSFailureIfActive(prep, "could not prepare the USB drive: %v", os.ErrPermission) {
+		t.Fatal("cancelled operation published a terminal failure")
+	}
+	select {
+	case fields := <-publisher.setMany:
+		t.Fatalf("cancelled operation clobbered idle publication: %#v", fields)
+	default:
+	}
+	close(prep.done)
+	select {
+	case <-returned:
+	case <-time.After(time.Second):
+		t.Fatal("normal request did not complete after teardown")
+	}
+}
+
+func TestUMSActiveOrPreparingIncludesPrepAndFailedExit(t *testing.T) {
+	prepCtx, cancelPrep := context.WithCancel(context.Background())
+	preparing := &Service{currentOp: &operation{
+		target: "ums-by-dbc",
+		ctx:    prepCtx,
+		cancel: cancelPrep,
+		done:   make(chan struct{}),
+	}}
+	if target, active := preparing.umsActiveOrPreparing(); !active || target != "ums-by-dbc" {
+		t.Fatalf("in-flight prep active,target = %v,%q, want true,ums-by-dbc", active, target)
+	}
+
+	done := make(chan struct{})
+	close(done)
+	failedExit := &Service{umsModeType: "ums", currentOp: &operation{
+		target: "normal",
+		ctx:    context.Background(),
+		cancel: func() {},
+		done:   done,
+	}}
+	if target, active := failedExit.umsActiveOrPreparing(); !active || target != "ums" {
+		t.Fatalf("failed switch-back active,target = %v,%q, want true,ums", active, target)
 	}
 }
 

@@ -16,10 +16,7 @@ func (s *Service) startBrakeExitListener() error {
 			return nil
 		}
 
-		s.mu.Lock()
-		current := s.currentOp
-		active := current != nil && isUMSTarget(current.target)
-		s.mu.Unlock()
+		_, active := s.umsActiveOrPreparing()
 		if !active {
 			return nil
 		}
