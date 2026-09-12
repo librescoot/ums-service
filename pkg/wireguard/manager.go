@@ -1,6 +1,7 @@
 package wireguard
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
@@ -18,17 +19,26 @@ func New() *Manager {
 	}
 }
 
-func (m *Manager) PrepareUSB(usbMountPath string) error {
+func (m *Manager) PrepareUSB(ctx context.Context, usbMountPath string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	wgDir := filepath.Join(usbMountPath, "wireguard")
 	if err := os.MkdirAll(wgDir, 0755); err != nil {
 		return fmt.Errorf("failed to create wireguard directory: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	log.Println("Created wireguard directory on USB drive")
 	return nil
 }
 
 // CopyToUSB exports local .conf files; it does not remove stale USB files.
-func (m *Manager) CopyToUSB(usbMountPath string) error {
+func (m *Manager) CopyToUSB(ctx context.Context, usbMountPath string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if _, err := os.Stat(m.configDir); os.IsNotExist(err) {
 		log.Printf("WireGuard config directory %s does not exist, skipping", m.configDir)
 		return nil
@@ -43,6 +53,9 @@ func (m *Manager) CopyToUSB(usbMountPath string) error {
 
 	copiedCount := 0
 	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".conf") {
 			continue
 		}
@@ -56,6 +69,9 @@ func (m *Manager) CopyToUSB(usbMountPath string) error {
 			continue
 		}
 
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if err := os.WriteFile(destPath, input, 0644); err != nil {
 			log.Printf("Failed to write %s: %v", destPath, err)
 			continue
@@ -76,7 +92,10 @@ func (m *Manager) CopyToUSB(usbMountPath string) error {
 
 // SyncFromUSB treats the USB wireguard directory as authoritative: local .conf files
 // absent there are removed, including when the directory is empty.
-func (m *Manager) SyncFromUSB(usbMountPath string) (bool, error) {
+func (m *Manager) SyncFromUSB(ctx context.Context, usbMountPath string) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	srcDir := filepath.Join(usbMountPath, "wireguard")
 
 	if _, err := os.Stat(srcDir); os.IsNotExist(err) {
@@ -106,6 +125,9 @@ func (m *Manager) SyncFromUSB(usbMountPath string) (bool, error) {
 
 	processedFiles := make(map[string]bool)
 	for _, entry := range usbEntries {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".conf") {
 			continue
 		}
@@ -128,6 +150,9 @@ func (m *Manager) SyncFromUSB(usbMountPath string) (bool, error) {
 		}
 
 		if needUpdate {
+			if err := ctx.Err(); err != nil {
+				return false, err
+			}
 			if err := os.WriteFile(destPath, input, 0644); err != nil {
 				log.Printf("Failed to write %s: %v", destPath, err)
 				continue
@@ -138,6 +163,9 @@ func (m *Manager) SyncFromUSB(usbMountPath string) (bool, error) {
 	}
 
 	for filename := range existingFiles {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
 		if !processedFiles[filename] {
 			filePath := filepath.Join(m.configDir, filename)
 			if err := os.Remove(filePath); err != nil {
@@ -151,6 +179,9 @@ func (m *Manager) SyncFromUSB(usbMountPath string) (bool, error) {
 
 	if len(processedFiles) == 0 && len(existingFiles) > 0 {
 		for filename := range existingFiles {
+			if err := ctx.Err(); err != nil {
+				return false, err
+			}
 			filePath := filepath.Join(m.configDir, filename)
 			if err := os.Remove(filePath); err != nil {
 				log.Printf("Failed to remove %s: %v", filePath, err)

@@ -1,6 +1,7 @@
 package uplink
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
@@ -25,15 +26,24 @@ func New() *Manager {
 	}
 }
 
-func (m *Manager) PrepareUSB(usbMountPath string) error {
+func (m *Manager) PrepareUSB(ctx context.Context, usbMountPath string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	dest := filepath.Join(usbMountPath, m.dirName)
 	if err := os.MkdirAll(dest, 0755); err != nil {
 		return fmt.Errorf("failed to create uplink-service directory: %w", err)
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	return nil
 }
 
-func (m *Manager) CopyToUSB(usbMountPath string) error {
+func (m *Manager) CopyToUSB(ctx context.Context, usbMountPath string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if _, err := os.Stat(m.srcPath); os.IsNotExist(err) {
 		log.Printf("uplink-service: %s does not exist, skipping", m.srcPath)
 		return nil
@@ -44,6 +54,9 @@ func (m *Manager) CopyToUSB(usbMountPath string) error {
 	if err != nil {
 		return fmt.Errorf("failed to read uplink-service config: %w", err)
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := os.WriteFile(dest, input, 0644); err != nil {
 		return fmt.Errorf("failed to write uplink-service config to USB: %w", err)
 	}
@@ -52,7 +65,10 @@ func (m *Manager) CopyToUSB(usbMountPath string) error {
 }
 
 // CopyFromUSB returns true if the on-device config changed.
-func (m *Manager) CopyFromUSB(usbMountPath string) (bool, error) {
+func (m *Manager) CopyFromUSB(ctx context.Context, usbMountPath string) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	src := filepath.Join(usbMountPath, m.dirName, configFile)
 	if _, err := os.Stat(src); os.IsNotExist(err) {
 		return false, nil
@@ -63,6 +79,10 @@ func (m *Manager) CopyFromUSB(usbMountPath string) (bool, error) {
 		return false, fmt.Errorf("failed to read uplink-service config from USB: %w", err)
 	}
 
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+
 	if existing, err := os.ReadFile(m.srcPath); err == nil {
 		if string(existing) == string(input) {
 			log.Printf("uplink-service: config.yaml unchanged")
@@ -70,6 +90,9 @@ func (m *Manager) CopyFromUSB(usbMountPath string) (bool, error) {
 		}
 	}
 
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	if err := os.MkdirAll(configDir, 0755); err != nil {
 		return false, fmt.Errorf("failed to create uplink-service directory: %w", err)
 	}

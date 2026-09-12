@@ -1,6 +1,7 @@
 package settings
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
@@ -19,19 +20,28 @@ func New() *Loader {
 	}
 }
 
-func (l *Loader) CopyToUSB(usbMountPath string) error {
+func (l *Loader) CopyToUSB(ctx context.Context, usbMountPath string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if _, err := os.Stat(l.settingsFile); os.IsNotExist(err) {
 		log.Printf("Settings file %s does not exist, skipping", l.settingsFile)
 		return nil
 	}
 
 	destPath := filepath.Join(usbMountPath, "settings.toml")
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	input, err := os.ReadFile(l.settingsFile)
 	if err != nil {
 		return fmt.Errorf("failed to read settings file: %w", err)
 	}
 
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := os.WriteFile(destPath, input, 0644); err != nil {
 		return fmt.Errorf("failed to write settings to USB: %w", err)
 	}
@@ -40,7 +50,10 @@ func (l *Loader) CopyToUSB(usbMountPath string) error {
 	return nil
 }
 
-func (l *Loader) CopyFromUSB(usbMountPath string) (bool, error) {
+func (l *Loader) CopyFromUSB(ctx context.Context, usbMountPath string) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	srcPath := filepath.Join(usbMountPath, "settings.toml")
 
 	if _, err := os.Stat(srcPath); os.IsNotExist(err) {
@@ -51,6 +64,10 @@ func (l *Loader) CopyFromUSB(usbMountPath string) (bool, error) {
 	input, err := os.ReadFile(srcPath)
 	if err != nil {
 		return false, fmt.Errorf("failed to read settings from USB: %w", err)
+	}
+
+	if err := ctx.Err(); err != nil {
+		return false, err
 	}
 
 	var dummy map[string]interface{}
@@ -65,6 +82,9 @@ func (l *Loader) CopyFromUSB(usbMountPath string) (bool, error) {
 	}
 
 	if changed {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
 		if err := os.WriteFile(l.settingsFile, input, 0644); err != nil {
 			return false, fmt.Errorf("failed to write settings file: %w", err)
 		}

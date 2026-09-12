@@ -310,13 +310,19 @@ func parseSemver(v string) (bool, [3]int) {
 // so host-written files that have not been imported yet must not be swept.
 // This only touches the on-drive directory: /data/ota staging and
 // update-service's delta base are deliberately untouched.
-func (l *Loader) PrepareUSB(usbMountPath string, discardStale bool, logger *umslog.Logger) error {
+func (l *Loader) PrepareUSB(ctx context.Context, usbMountPath string, discardStale bool, logger *umslog.Logger) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	updateDir := filepath.Join(usbMountPath, "system-update")
 	if err := os.MkdirAll(updateDir, 0755); err != nil {
 		return fmt.Errorf("failed to create system-update directory: %w", err)
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if discardStale {
-		discarded, err := discardStaleUpdateFiles(updateDir)
+		discarded, err := discardStaleUpdateFiles(ctx, updateDir)
 		if err != nil {
 			return fmt.Errorf("failed to inspect system-update directory: %w", err)
 		}
@@ -335,13 +341,16 @@ func (l *Loader) PrepareUSB(usbMountPath string, discardStale bool, logger *umsl
 // drive and reports how many it removed. Only files UMS would itself treat as
 // artifacts (librescoot-*-{mdb,dbc}.mender/.delta, via updateArtifactTarget)
 // are removed; a user's unrelated notes.delta or other file is left alone.
-func discardStaleUpdateFiles(dir string) (int, error) {
+func discardStaleUpdateFiles(ctx context.Context, dir string) (int, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return 0, err
 	}
 	discarded := 0
 	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return discarded, err
+		}
 		if entry.IsDir() || updateArtifactTarget(entry.Name()) == "" {
 			continue
 		}

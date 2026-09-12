@@ -25,10 +25,16 @@ func New(dbcInterface *dbc.Interface) *Runner {
 	}
 }
 
-func (r *Runner) PrepareUSB(usbMountPath string) error {
+func (r *Runner) PrepareUSB(ctx context.Context, usbMountPath string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	scriptsDir := filepath.Join(usbMountPath, "scripts")
 	if err := os.MkdirAll(scriptsDir, 0755); err != nil {
 		return fmt.Errorf("failed to create scripts directory: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	log.Println("Created scripts directory on USB drive")
 	return nil

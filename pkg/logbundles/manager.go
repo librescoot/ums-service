@@ -1,6 +1,7 @@
 package logbundles
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -56,15 +57,24 @@ func (m *Manager) PruneOldBundles(keep int) error {
 	return nil
 }
 
-func (m *Manager) PrepareUSB(usbMountPath string) error {
+func (m *Manager) PrepareUSB(ctx context.Context, usbMountPath string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	dest := filepath.Join(usbMountPath, "log-bundles")
 	if err := os.MkdirAll(dest, 0755); err != nil {
 		return fmt.Errorf("failed to create log-bundles directory: %w", err)
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	return nil
 }
 
-func (m *Manager) CopyToUSB(usbMountPath string) error {
+func (m *Manager) CopyToUSB(ctx context.Context, usbMountPath string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	bundles, err := m.list()
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -80,9 +90,15 @@ func (m *Manager) CopyToUSB(usbMountPath string) error {
 
 	copied := 0
 	for _, name := range bundles {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		src := filepath.Join(m.dir, name)
 		dst := filepath.Join(destDir, name)
-		if err := copyFile(src, dst); err != nil {
+		if err := copyFile(ctx, src, dst); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			log.Printf("log bundles: failed to copy %s: %v", name, err)
 			continue
 		}
@@ -92,7 +108,7 @@ func (m *Manager) CopyToUSB(usbMountPath string) error {
 	if copied > 0 {
 		log.Printf("log bundles: copied %d bundle(s) to USB drive", copied)
 	}
-	return nil
+	return ctx.Err()
 }
 
 func (m *Manager) list() ([]string, error) {
@@ -113,7 +129,10 @@ func (m *Manager) list() ([]string, error) {
 	return bundles, nil
 }
 
-func copyFile(src, dst string) error {
+func copyFile(ctx context.Context, src, dst string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	in, err := os.Open(src)
 	if err != nil {
 		return err
@@ -126,7 +145,29 @@ func copyFile(src, dst string) error {
 	}
 	defer out.Close()
 
-	if _, err := io.Copy(out, in); err != nil {
+	buf := make([]byte, 32*1024)
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		n, readErr := in.Read(buf)
+		if n > 0 {
+			written, writeErr := out.Write(buf[:n])
+			if writeErr != nil {
+				return writeErr
+			}
+			if written != n {
+				return io.ErrShortWrite
+			}
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return readErr
+		}
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 	return out.Sync()

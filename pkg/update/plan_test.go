@@ -120,7 +120,7 @@ func TestPrepareUSBDiscardsStaleUpdateFiles(t *testing.T) {
 	}
 
 	l := &Loader{}
-	if err := l.PrepareUSB(usb, true, nil); err != nil {
+	if err := l.PrepareUSB(context.Background(), usb, true, nil); err != nil {
 		t.Fatalf("PrepareUSB: %v", err)
 	}
 	for _, n := range leftovers {
@@ -137,7 +137,7 @@ func TestPrepareUSBDiscardsStaleUpdateFiles(t *testing.T) {
 	}
 
 	// Clean case: re-entering with the directory already prepared is a no-op.
-	if err := l.PrepareUSB(usb, true, nil); err != nil {
+	if err := l.PrepareUSB(context.Background(), usb, true, nil); err != nil {
 		t.Fatalf("PrepareUSB on a clean directory: %v", err)
 	}
 }
@@ -157,7 +157,7 @@ func TestPrepareUSBKeepsStaleWhenNotSweeping(t *testing.T) {
 	}
 
 	l := &Loader{}
-	if err := l.PrepareUSB(usb, false, nil); err != nil {
+	if err := l.PrepareUSB(context.Background(), usb, false, nil); err != nil {
 		t.Fatalf("PrepareUSB: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(updateDir, staged)); err != nil {

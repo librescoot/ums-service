@@ -425,22 +425,22 @@ func (s *Service) runUMSOp(op *operation) error {
 		run      func() error
 	}
 	steps := []prepStep{
-		{"Error copying settings to USB", func() error { return s.settingsLdr.CopyToUSB(mountPoint) }},
+		{"Error copying settings to USB", func() error { return s.settingsLdr.CopyToUSB(op.ctx, mountPoint) }},
 		{"Error preparing update directory", func() error {
-			return s.updateLdr.PrepareUSB(mountPoint, discardStale, umslog.New(s.client))
+			return s.updateLdr.PrepareUSB(op.ctx, mountPoint, discardStale, umslog.New(s.client))
 		}},
-		{"Error preparing maps directory", func() error { return s.mapsUpdater.PrepareUSB(mountPoint) }},
-		{"Error preparing wireguard directory", func() error { return s.wgManager.PrepareUSB(mountPoint) }},
-		{"Error copying wireguard configs to USB", func() error { return s.wgManager.CopyToUSB(mountPoint) }},
-		{"Error preparing radio-gaga directory", func() error { return s.radioGagaMgr.PrepareUSB(mountPoint) }},
-		{"Error copying radio-gaga config to USB", func() error { return s.radioGagaMgr.CopyToUSB(mountPoint) }},
-		{"Error preparing uplink-service directory", func() error { return s.uplinkMgr.PrepareUSB(mountPoint) }},
-		{"Error copying uplink-service config to USB", func() error { return s.uplinkMgr.CopyToUSB(mountPoint) }},
+		{"Error preparing maps directory", func() error { return s.mapsUpdater.PrepareUSB(op.ctx, mountPoint) }},
+		{"Error preparing wireguard directory", func() error { return s.wgManager.PrepareUSB(op.ctx, mountPoint) }},
+		{"Error copying wireguard configs to USB", func() error { return s.wgManager.CopyToUSB(op.ctx, mountPoint) }},
+		{"Error preparing radio-gaga directory", func() error { return s.radioGagaMgr.PrepareUSB(op.ctx, mountPoint) }},
+		{"Error copying radio-gaga config to USB", func() error { return s.radioGagaMgr.CopyToUSB(op.ctx, mountPoint) }},
+		{"Error preparing uplink-service directory", func() error { return s.uplinkMgr.PrepareUSB(op.ctx, mountPoint) }},
+		{"Error copying uplink-service config to USB", func() error { return s.uplinkMgr.CopyToUSB(op.ctx, mountPoint) }},
 		{"Error copying onboot.sh to USB", func() error { return s.onbootMgr.CopyToUSB(mountPoint) }},
-		{"Error preparing log-bundles directory", func() error { return s.logBundlesMgr.PrepareUSB(mountPoint) }},
-		{"Error copying log bundles to USB", func() error { return s.logBundlesMgr.CopyToUSB(mountPoint) }},
-		{"Error collecting diagnostics to USB", func() error { s.diagnostics.CollectToUSB(mountPoint); return nil }},
-		{"Error preparing scripts directory", func() error { return s.scriptRunner.PrepareUSB(mountPoint) }},
+		{"Error preparing log-bundles directory", func() error { return s.logBundlesMgr.PrepareUSB(op.ctx, mountPoint) }},
+		{"Error copying log bundles to USB", func() error { return s.logBundlesMgr.CopyToUSB(op.ctx, mountPoint) }},
+		{"Error collecting diagnostics to USB", func() error { s.diagnostics.CollectToUSB(op.ctx, mountPoint); return nil }},
+		{"Error preparing scripts directory", func() error { return s.scriptRunner.PrepareUSB(op.ctx, mountPoint) }},
 	}
 	for _, step := range steps {
 		if cancelled() {
@@ -550,7 +550,7 @@ func (s *Service) runSwitchToNormal(prevMode string) error {
 
 	s.setStep("settings")
 	settingsChanged := false
-	if changed, err := s.settingsLdr.CopyFromUSB(mountPoint); err != nil {
+	if changed, err := s.settingsLdr.CopyFromUSB(ctx, mountPoint); err != nil {
 		logger.Error("settings", "%v", err)
 		log.Printf("Error processing settings: %v", err)
 	} else {
@@ -560,7 +560,7 @@ func (s *Service) runSwitchToNormal(prevMode string) error {
 
 	s.setStep("wireguard")
 	wgChanged := false
-	if changed, err := s.wgManager.SyncFromUSB(mountPoint); err != nil {
+	if changed, err := s.wgManager.SyncFromUSB(ctx, mountPoint); err != nil {
 		logger.Error("wireguard", "%v", err)
 		log.Printf("Error processing wireguard configs: %v", err)
 	} else {
@@ -570,7 +570,7 @@ func (s *Service) runSwitchToNormal(prevMode string) error {
 
 	s.setStep("radio-gaga")
 	radioGagaChanged := false
-	if changed, err := s.radioGagaMgr.CopyFromUSB(mountPoint); err != nil {
+	if changed, err := s.radioGagaMgr.CopyFromUSB(ctx, mountPoint); err != nil {
 		logger.Error("radio-gaga", "%v", err)
 		log.Printf("Error processing radio-gaga config: %v", err)
 	} else {
@@ -580,7 +580,7 @@ func (s *Service) runSwitchToNormal(prevMode string) error {
 
 	s.setStep("uplink-service")
 	uplinkChanged := false
-	if changed, err := s.uplinkMgr.CopyFromUSB(mountPoint); err != nil {
+	if changed, err := s.uplinkMgr.CopyFromUSB(ctx, mountPoint); err != nil {
 		logger.Error("uplink-service", "%v", err)
 		log.Printf("Error processing uplink-service config: %v", err)
 	} else {

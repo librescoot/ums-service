@@ -55,10 +55,16 @@ func New(dbcInterface *dbc.Interface, client *ipc.Client) *Updater {
 	}
 }
 
-func (u *Updater) PrepareUSB(usbMountPath string) error {
+func (u *Updater) PrepareUSB(ctx context.Context, usbMountPath string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	mapsDir := filepath.Join(usbMountPath, "maps")
 	if err := os.MkdirAll(mapsDir, 0755); err != nil {
 		return fmt.Errorf("failed to create maps directory: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	log.Println("Created maps directory on USB drive")
 	return nil

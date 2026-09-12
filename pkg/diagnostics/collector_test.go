@@ -1,9 +1,15 @@
 package diagnostics
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 type fakeHashes struct {
@@ -108,5 +114,44 @@ func TestModemSectionReportsReadError(t *testing.T) {
 	got := c.modemSection()
 	if !strings.Contains(got, "ERROR: reading internet hash: boom") {
 		t.Errorf("expected the read error, got:\n%s", got)
+	}
+}
+
+func TestRunDBCCommandCancelsBlockedCommand(t *testing.T) {
+	originalCommandContext := commandContext
+	started := filepath.Join(t.TempDir(), "started")
+	commandContext = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		return exec.CommandContext(ctx, "sh", "-c", fmt.Sprintf("touch %q; while :; do :; done", started))
+	}
+	t.Cleanup(func() { commandContext = originalCommandContext })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		_, err := New(nil).runDBCCommand(ctx, "blocked")
+		result <- err
+	}()
+
+	deadline := time.After(time.Second)
+	for {
+		if _, err := os.Stat(started); err == nil {
+			cancel()
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("blocked command was not started")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("runDBCCommand error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("runDBCCommand did not return promptly after cancellation")
 	}
 }
