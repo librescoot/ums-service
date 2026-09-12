@@ -300,13 +300,53 @@ func parseSemver(v string) (bool, [3]int) {
 	return true, out
 }
 
-func (l *Loader) PrepareUSB(usbMountPath string) error {
+// PrepareUSB creates the system-update directory on the exported drive and
+// discards any update artifacts a previous cycle left there. The exit path's
+// CleanDrive() wipes the drive after a completed cycle, so a file that survives
+// to the next entry is the residue of a cycle that died before it could exit;
+// leaving it would present it to the host and import it again on the next exit.
+// This only touches the on-drive directory: /data/ota staging and
+// update-service's delta base are deliberately untouched.
+func (l *Loader) PrepareUSB(usbMountPath string, logger *umslog.Logger) error {
 	updateDir := filepath.Join(usbMountPath, "system-update")
 	if err := os.MkdirAll(updateDir, 0755); err != nil {
 		return fmt.Errorf("failed to create system-update directory: %w", err)
 	}
+	discarded, err := discardStaleUpdateFiles(updateDir)
+	if err != nil {
+		return fmt.Errorf("failed to inspect system-update directory: %w", err)
+	}
+	if discarded > 0 {
+		log.Printf("Discarded %d stale update file(s) left in %s by a previous cycle", discarded, updateDir)
+		if logger != nil {
+			logger.Logf("updates", "discarded stale update files left by a previous cycle (%d file(s))", discarded)
+		}
+	}
 	log.Println("Created system-update directory on USB drive")
 	return nil
+}
+
+// discardStaleUpdateFiles removes the update artifacts left on the exported
+// drive and reports how many it removed. Non-artifact files are left alone.
+func discardStaleUpdateFiles(dir string) (int, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0, err
+	}
+	discarded := 0
+	for _, entry := range entries {
+		if entry.IsDir() || !isUpdateFile(entry.Name()) {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		if err := os.Remove(path); err != nil {
+			log.Printf("Warning: failed to discard stale update file %s: %v", path, err)
+			continue
+		}
+		discarded++
+		log.Printf("Discarded stale update file %s", path)
+	}
+	return discarded, nil
 }
 
 // stagedUpdateCommand is the path-free command UMS pushes for a staged board.

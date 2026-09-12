@@ -46,7 +46,9 @@ Update artifacts placed in `system-update/` are grouped per board (`librescoot-*
 | more than one `.mender`, or a `.mender` together with any `.delta` | refused |
 | deltas spanning more than one channel | refused |
 
-A refused board is skipped without staging anything, while any other board in the same drop is processed normally. A refusal is reported in three places: the journald log, `usb:log`, and the dashboard: `usb.last-result` is set to `error` (so `lsc usb status` shows it) and an `error` notification is published on `scootui:notification`.
+A refused board is skipped without staging anything, while any other board in the same drop is processed normally. A refusal is reported in three places: the journald log, `usb:log`, and the dashboard: `usb.last-result` is set to `error` (so `lsc usb status` shows it) and an `error` notification is published on `scootui:notification`. When the other board in the same drop proceeds and installs, the refusal is folded into the terminal outcome's `usb.last-result-detail`, so `lsc usb status` still shows it after the install finishes.
+
+On entry the service discards any update artifact still present in `system-update/`. A completed cycle wipes the drive on its way out, so a file found there is the residue of a cycle that died before it exited; it is removed and the discard is recorded in `usb:log`. The `/data/ota` staging directories and update-service's delta base are never touched.
 
 update-service owns the final discovery: the running version's base `.mender` sits permanently in that directory and is ignored, a newer `.mender` is installed as a full image, and a delta chain is resolved from the deltas' own metadata and applied as one mender install with one reboot.
 

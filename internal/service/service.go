@@ -287,7 +287,7 @@ func (s *Service) switchToUMS(mode string) error {
 		log.Printf("Error copying settings to USB: %v", err)
 	}
 
-	if err := s.updateLdr.PrepareUSB(mountPoint); err != nil {
+	if err := s.updateLdr.PrepareUSB(mountPoint, umslog.New(s.client)); err != nil {
 		log.Printf("Error preparing update directory: %v", err)
 	}
 

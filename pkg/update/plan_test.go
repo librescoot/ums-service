@@ -100,6 +100,44 @@ func TestPlanBoardUpdate(t *testing.T) {
 	}
 }
 
+// TestPrepareUSBDiscardsStaleUpdateFiles pins the UMS-entry sweep: update
+// artifacts left on the drive by a cycle that died before its exit path are
+// removed, while unrelated files survive; a clean directory is a no-op.
+func TestPrepareUSBDiscardsStaleUpdateFiles(t *testing.T) {
+	usb := t.TempDir()
+	updateDir := filepath.Join(usb, "system-update")
+	if err := os.MkdirAll(updateDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	leftovers := []string{
+		"librescoot-unu-mdb-nightly-20260102T000000.mender",
+		"librescoot-unu-dbc-nightly-20260102T000000.delta",
+	}
+	for _, n := range append(append([]string{}, leftovers...), "notes.txt") {
+		if err := os.WriteFile(filepath.Join(updateDir, n), []byte("x"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	l := &Loader{}
+	if err := l.PrepareUSB(usb, nil); err != nil {
+		t.Fatalf("PrepareUSB: %v", err)
+	}
+	for _, n := range leftovers {
+		if _, err := os.Stat(filepath.Join(updateDir, n)); !os.IsNotExist(err) {
+			t.Errorf("stale update file %s survived: %v", n, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(updateDir, "notes.txt")); err != nil {
+		t.Errorf("non-update file was removed: %v", err)
+	}
+
+	// Clean case: re-entering with the directory already prepared is a no-op.
+	if err := l.PrepareUSB(usb, nil); err != nil {
+		t.Fatalf("PrepareUSB on a clean directory: %v", err)
+	}
+}
+
 func TestProcessUpdatesMDBDeltaChain(t *testing.T) {
 	usb := t.TempDir()
 	updateDir := filepath.Join(usb, "system-update")
