@@ -478,7 +478,10 @@ func (s *Service) switchToNormal(prevMode string) error {
 	} else {
 		logger.Logf("updates", "done")
 	}
-	if err == nil && len(queued.Refused) > 0 {
+	// Report a refusal regardless of whether the other board's processing
+	// returned an error: the refusal is appended to queued before any DBC work
+	// runs, so it is available on both paths and must not be dropped.
+	if len(queued.Refused) > 0 {
 		s.reportRefusals(queued.Refused)
 	}
 	logger.ClearProgress()
@@ -580,11 +583,19 @@ func (s *Service) awaitInstallsAndReboot(ctx context.Context, queued update.Queu
 
 	logger := umslog.New(s.client)
 
+	// Terminal results must carry a refusal from the same mixed drop. The
+	// loader records a refusal before the other board installs, but the
+	// awaiter's final write happens later and would otherwise replace
+	// usb.last-result (error) with the install outcome alone.
+	setResult := func(result, format string, args ...any) {
+		s.setResult(result, "%s", withRefusalDetail(fmt.Sprintf(format, args...), queued.Refused))
+	}
+
 	source, err := update.NewIPCOTASource(s.client)
 	if err != nil {
 		logger.Error("reboot", "subscribe to ota hash: %v", err)
 		log.Printf("awaiter: subscribe failed: %v", err)
-		s.setResult(resultError, "could not watch the ota hash: %v", err)
+		setResult(resultError, "could not watch the ota hash: %v", err)
 		return
 	}
 	// Recording keeps the observed status history so a failed wait can
@@ -601,16 +612,16 @@ func (s *Service) awaitInstallsAndReboot(ctx context.Context, queued update.Queu
 	releaseRebootOwner := false
 	if queued.MDB {
 		if err := os.MkdirAll(filepath.Dir(mdbRebootOwnerPath), 0o755); err != nil {
-			s.setResult(resultError, "could not create MDB reboot owner directory: %v", err)
+			setResult(resultError, "could not create MDB reboot owner directory: %v", err)
 			return
 		}
 		if err := os.WriteFile(mdbRebootOwnerPath, []byte("ums\n"), 0o644); err != nil {
-			s.setResult(resultError, "could not persist MDB reboot ownership: %v", err)
+			setResult(resultError, "could not persist MDB reboot ownership: %v", err)
 			return
 		}
 		if err := s.client.HSet("ota", "reboot-owner:mdb", "ums"); err != nil {
 			_ = os.Remove(mdbRebootOwnerPath)
-			s.setResult(resultError, "could not claim MDB reboot ownership: %v", err)
+			setResult(resultError, "could not claim MDB reboot ownership: %v", err)
 			return
 		}
 		ownerDone := make(chan struct{})
@@ -653,7 +664,7 @@ func (s *Service) awaitInstallsAndReboot(ctx context.Context, queued update.Queu
 		if _, perr := s.client.LPush(p.Channel, p.Value); perr != nil {
 			logger.Error("reboot", "LPush %s failed: %v", p.Channel, perr)
 			log.Printf("awaiter: LPush %s failed: %v", p.Channel, perr)
-			s.setResult(resultError, "could not queue install on %s: %v", p.Channel, perr)
+			setResult(resultError, "could not queue install on %s: %v", p.Channel, perr)
 			return
 		}
 		logger.Logf("reboot", "queued %s", p.Channel)
@@ -681,10 +692,10 @@ func (s *Service) awaitInstallsAndReboot(ctx context.Context, queued update.Queu
 			case errors.Is(err, context.Canceled):
 				// A new UMS entry clears the superseded result.
 			case errors.Is(err, context.DeadlineExceeded):
-				s.setResult(resultTimeout, "install did not finish within %s (still waiting on %s)",
+				setResult(resultTimeout, "install did not finish within %s (still waiting on %s)",
 					installOverallCap, strings.Join(pending, ", "))
 			default:
-				s.setResult(resultInstallError, "%v", err)
+				setResult(resultInstallError, "%v", err)
 			}
 			return
 		}
@@ -697,7 +708,7 @@ func (s *Service) awaitInstallsAndReboot(ctx context.Context, queued update.Queu
 	releaseRebootOwner = true
 
 	if queued.DBC && !queued.MDB {
-		s.setResult(resultRebootTriggered, "DBC reboot completed")
+		setResult(resultRebootTriggered, "DBC reboot completed")
 		logger.Logf("reboot", "DBC reboot completed by update-service")
 		log.Println("awaiter: DBC reboot completed by update-service")
 		return
@@ -709,13 +720,13 @@ func (s *Service) awaitInstallsAndReboot(ctx context.Context, queued update.Queu
 	if err != nil {
 		logger.Error("reboot", "skip: failed to read vehicle state: %v", err)
 		log.Printf("awaiter: failed to read vehicle state: %v", err)
-		s.setResult(resultError, "could not read vehicle state: %v", err)
+		setResult(resultError, "could not read vehicle state: %v", err)
 		return
 	}
 	if !rebootAllowedVehicleStates[state] {
 		logger.Logf("reboot", "skip: vehicle state %q not in allowed set", state)
 		log.Printf("awaiter: skip reboot, vehicle state is %q", state)
-		s.setResult(resultVehicleState,
+		setResult(resultVehicleState,
 			"install is staged but the reboot was skipped: vehicle state %q does not allow it", state)
 		return
 	}
@@ -731,10 +742,10 @@ func (s *Service) awaitInstallsAndReboot(ctx context.Context, queued update.Queu
 	if _, err := s.client.LPush("scooter:power", "reboot"); err != nil {
 		logger.Error("reboot", "LPush scooter:power reboot failed: %v", err)
 		log.Printf("awaiter: failed to trigger MDB reboot: %v", err)
-		s.setResult(resultError, "could not trigger the MDB reboot: %v", err)
+		setResult(resultError, "could not trigger the MDB reboot: %v", err)
 		return
 	}
-	s.setResult(resultRebootTriggered, "MDB reboot triggered")
+	setResult(resultRebootTriggered, "MDB reboot triggered")
 	logger.Logf("reboot", "MDB reboot triggered")
 	log.Println("awaiter: MDB reboot triggered")
 }
@@ -1039,28 +1050,68 @@ const notificationTTL = 30000
 // Only the refused board is skipped; any other board in the same drop still
 // installs.
 func (s *Service) reportRefusals(refusals []update.Refusal) {
+	detail := refusalDetail(refusals)
+	s.setResult(resultError, "%s", detail)
+	s.publishNotification("Update refused", detail)
+}
+
+// refusalDetail renders refusals for usb.last-result-detail as
+// "MDB: reason; DBC: reason".
+func refusalDetail(refusals []update.Refusal) string {
 	parts := make([]string, 0, len(refusals))
 	for _, r := range refusals {
 		parts = append(parts, fmt.Sprintf("%s: %s", strings.ToUpper(r.Board), r.Reason))
 	}
-	detail := strings.Join(parts, "; ")
-	s.setResult(resultError, "%s", detail)
-	s.publishNotification("Update refused", detail)
+	return strings.Join(parts, "; ")
+}
+
+// withRefusalDetail folds a refused board into a terminal result detail. A
+// refusal is recorded when the drop is processed, but in a mixed cycle the
+// awaiter later rewrites usb.last-result with the installing board's outcome,
+// which would drop the refusal from `lsc usb status`. Appending it to every
+// terminal detail keeps it visible to the end of the cycle.
+func withRefusalDetail(detail string, refusals []update.Refusal) string {
+	rd := refusalDetail(refusals)
+	if rd == "" {
+		return detail
+	}
+	if detail == "" {
+		return rd
+	}
+	return detail + "; refused: " + rd
 }
 
 // publishNotification sends one external notification to the dashboard over the
 // shipped scootui:notification ingress contract. Fire-and-forget: a dashboard
 // that is off or disconnected must not fail a UMS cycle.
 func (s *Service) publishNotification(title, body string) {
-	payload := struct {
-		ID       string `json:"id"`
-		Source   string `json:"source"`
-		Action   string `json:"action"`
-		Title    string `json:"title"`
-		Body     string `json:"body"`
-		Severity string `json:"severity"`
-		TTLms    int    `json:"ttl_ms"`
-	}{
+	data, err := json.Marshal(newNotification(title, body))
+	if err != nil {
+		log.Printf("Error encoding notification: %v", err)
+		return
+	}
+	if _, err := s.client.Publish("scootui:notification", string(data), ipc.Sync()); err != nil {
+		log.Printf("Error publishing notification: %v", err)
+	}
+}
+
+// notification is the payload published on the shared scootui:notification
+// ingress channel. The JSON field names, the id/source charset and the
+// severity value are the ingress contract; TestNotificationPayload pins them.
+type notification struct {
+	ID       string `json:"id"`
+	Source   string `json:"source"`
+	Action   string `json:"action"`
+	Title    string `json:"title"`
+	Body     string `json:"body"`
+	Severity string `json:"severity"`
+	TTLms    int    `json:"ttl_ms"`
+}
+
+// newNotification builds the refusal notification, applying the ingress
+// title/body UTF-16 limits.
+func newNotification(title, body string) notification {
+	return notification{
 		ID:       "ums-update-refused",
 		Source:   "ums",
 		Action:   "show",
@@ -1068,14 +1119,6 @@ func (s *Service) publishNotification(title, body string) {
 		Body:     truncateUTF16(body, 512),
 		Severity: "error",
 		TTLms:    notificationTTL,
-	}
-	data, err := json.Marshal(payload)
-	if err != nil {
-		log.Printf("Error encoding notification: %v", err)
-		return
-	}
-	if _, err := s.client.Publish("scootui:notification", string(data), ipc.Sync()); err != nil {
-		log.Printf("Error publishing notification: %v", err)
 	}
 }
 

@@ -1,9 +1,13 @@
 package service
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"github.com/librescoot/ums-service/pkg/update"
 )
 
 // TestDecideRebootOwnerAction covers the startup reconciliation of a
@@ -225,5 +229,78 @@ func TestTruncateUTF16(t *testing.T) {
 				t.Errorf("truncateUTF16(%q, %d) = %q, want %q", tc.in, tc.max, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestWithRefusalDetail pins the mixed-cycle result contract: a refusal from a
+// board that was skipped must be folded into the terminal result detail, since
+// the awaiter's later write for the installing board would otherwise be the
+// only thing `lsc usb status` shows.
+func TestWithRefusalDetail(t *testing.T) {
+	refusals := []update.Refusal{{Board: "dbc", Reason: "two full images staged"}}
+
+	if got, want := withRefusalDetail("MDB reboot triggered", refusals),
+		"MDB reboot triggered; refused: DBC: two full images staged"; got != want {
+		t.Errorf("withRefusalDetail = %q, want %q", got, want)
+	}
+	if got, want := withRefusalDetail("", refusals), "DBC: two full images staged"; got != want {
+		t.Errorf("withRefusalDetail(empty) = %q, want %q", got, want)
+	}
+	if got, want := withRefusalDetail("MDB reboot triggered", nil), "MDB reboot triggered"; got != want {
+		t.Errorf("withRefusalDetail(no refusals) = %q, want %q", got, want)
+	}
+
+	both := withRefusalDetail("x", []update.Refusal{
+		{Board: "mdb", Reason: "ambiguous"},
+		{Board: "dbc", Reason: "cross-channel"},
+	})
+	if !strings.Contains(both, "MDB: ambiguous") || !strings.Contains(both, "DBC: cross-channel") {
+		t.Errorf("withRefusalDetail = %q, want both boards", both)
+	}
+}
+
+// TestNotificationPayload pins the scootui:notification ingress contract: the
+// exact JSON field names and values, the refusal identity/severity, and the TTL
+// bounds. A tag typo or a dropped field would otherwise only surface as a
+// qWarning in the dashboard log.
+func TestNotificationPayload(t *testing.T) {
+	const title = "Update refused"
+	const body = "DBC: two full images staged"
+
+	data, err := json.Marshal(newNotification(title, body))
+	if err != nil {
+		t.Fatalf("marshal notification: %v", err)
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("unmarshal notification: %v", err)
+	}
+
+	want := map[string]any{
+		"id":       "ums-update-refused",
+		"source":   "ums",
+		"action":   "show",
+		"title":    title,
+		"body":     body,
+		"severity": "error",
+		"ttl_ms":   float64(notificationTTL),
+	}
+	if len(got) != len(want) {
+		t.Errorf("payload has %d fields, want %d: %v", len(got), len(want), got)
+	}
+	for field, value := range want {
+		if got[field] != value {
+			t.Errorf("payload[%q] = %v, want %v", field, got[field], value)
+		}
+	}
+	if notificationTTL < 1000 || notificationTTL > 60000 {
+		t.Errorf("ttl_ms = %d outside the ingress 1000-60000 range", notificationTTL)
+	}
+
+	// The builder applies the ingress title/body caps (120/512 UTF-16 units).
+	long := newNotification(strings.Repeat("x", 200), strings.Repeat("y", 600))
+	if len(long.Title) != 120 || len(long.Body) != 512 {
+		t.Errorf("caps not applied: title=%d body=%d, want 120/512", len(long.Title), len(long.Body))
 	}
 }
