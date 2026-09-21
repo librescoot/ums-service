@@ -156,7 +156,7 @@ func (m *Manager) SyncFromUSB(ctx context.Context, usbMountPath string) (bool, e
 			if err := ctx.Err(); err != nil {
 				return false, err
 			}
-			if err := fileutil.WriteFileAtomic(destPath, input, 0644); err != nil {
+			if err := fileutil.WriteFileAtomic(destPath, input, 0600); err != nil {
 				log.Printf("Failed to write %s: %v", destPath, err)
 				continue
 			}

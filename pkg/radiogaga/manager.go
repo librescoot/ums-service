@@ -96,10 +96,10 @@ func (m *Manager) CopyFromUSB(ctx context.Context, usbMountPath string) (bool, e
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
-	if err := os.MkdirAll(configDir, 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(m.srcPath), 0755); err != nil {
 		return false, fmt.Errorf("failed to create radio-gaga directory: %w", err)
 	}
-	if err := fileutil.WriteFileAtomic(m.srcPath, input, 0644); err != nil {
+	if err := fileutil.WriteFileAtomic(m.srcPath, input, 0600); err != nil {
 		return false, fmt.Errorf("failed to write radio-gaga config: %w", err)
 	}
 	log.Printf("radio-gaga: updated config.yaml from USB drive")
