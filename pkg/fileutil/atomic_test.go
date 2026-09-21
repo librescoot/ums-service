@@ -39,6 +39,35 @@ func TestWriteFileAtomicReplacesExistingFile(t *testing.T) {
 	}
 }
 
+func TestEnsureFileModeChangesPermissions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state")
+	if err := os.WriteFile(path, []byte("contents"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	changed, err := EnsureFileMode(path, 0o600)
+	if err != nil {
+		t.Fatalf("EnsureFileMode: %v", err)
+	}
+	if !changed {
+		t.Fatal("EnsureFileMode did not report a change")
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Errorf("mode = %o, want 600", info.Mode().Perm())
+	}
+	changed, err = EnsureFileMode(path, 0o600)
+	if err != nil {
+		t.Fatalf("EnsureFileMode: %v", err)
+	}
+	if changed {
+		t.Error("EnsureFileMode reported a change for an already-private file")
+	}
+}
+
 func TestCopyFileAtomicReplacesExistingFile(t *testing.T) {
 	dir := t.TempDir()
 	src := filepath.Join(dir, "source")

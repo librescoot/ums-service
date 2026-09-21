@@ -152,17 +152,28 @@ func (m *Manager) SyncFromUSB(ctx context.Context, usbMountPath string) (bool, e
 			needUpdate = string(existing) != string(input)
 		}
 
-		if needUpdate {
-			if err := ctx.Err(); err != nil {
-				return false, err
-			}
-			if err := fileutil.WriteFileAtomic(destPath, input, 0600); err != nil {
-				log.Printf("Failed to write %s: %v", destPath, err)
+		if !needUpdate {
+			modeChanged, err := fileutil.EnsureFileMode(destPath, 0600)
+			if err != nil {
+				log.Printf("Failed to secure %s: %v", destPath, err)
 				continue
 			}
-			changed = true
-			log.Printf("Updated WireGuard config: %s", filename)
+			if modeChanged {
+				changed = true
+				log.Printf("Repaired WireGuard config permissions: %s", filename)
+			}
+			continue
 		}
+
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		if err := fileutil.WriteFileAtomic(destPath, input, 0600); err != nil {
+			log.Printf("Failed to write %s: %v", destPath, err)
+			continue
+		}
+		changed = true
+		log.Printf("Updated WireGuard config: %s", filename)
 	}
 
 	for filename := range existingFiles {

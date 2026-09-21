@@ -88,8 +88,16 @@ func (m *Manager) CopyFromUSB(ctx context.Context, usbMountPath string) (bool, e
 
 	if existing, err := os.ReadFile(m.srcPath); err == nil {
 		if string(existing) == string(input) {
-			log.Printf("radio-gaga: config.yaml unchanged")
-			return false, nil
+			modeChanged, err := fileutil.EnsureFileMode(m.srcPath, 0600)
+			if err != nil {
+				return false, fmt.Errorf("failed to secure radio-gaga config: %w", err)
+			}
+			if modeChanged {
+				log.Printf("radio-gaga: repaired config.yaml permissions")
+			} else {
+				log.Printf("radio-gaga: config.yaml unchanged")
+			}
+			return modeChanged, nil
 		}
 	}
 
