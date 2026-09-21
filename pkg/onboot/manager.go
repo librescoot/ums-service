@@ -9,6 +9,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/librescoot/ums-service/pkg/fileutil"
 )
 
 const (
@@ -76,11 +78,8 @@ func (m *Manager) CopyFromUSB(usbMountPath string) (bool, error) {
 		return false, nil
 	}
 
-	if err := os.WriteFile(m.srcPath, input, 0755); err != nil {
+	if err := fileutil.WriteFileAtomic(m.srcPath, input, 0755); err != nil {
 		return false, fmt.Errorf("failed to write onboot.sh: %w", err)
-	}
-	if err := os.Chmod(m.srcPath, 0755); err != nil {
-		log.Printf("onboot: chmod failed: %v", err)
 	}
 	log.Printf("onboot: installed onboot.sh from USB drive")
 	return true, nil

@@ -6,6 +6,8 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+
+	"github.com/librescoot/ums-service/pkg/fileutil"
 )
 
 const (
@@ -97,7 +99,7 @@ func (m *Manager) CopyFromUSB(ctx context.Context, usbMountPath string) (bool, e
 	if err := os.MkdirAll(configDir, 0755); err != nil {
 		return false, fmt.Errorf("failed to create radio-gaga directory: %w", err)
 	}
-	if err := os.WriteFile(m.srcPath, input, 0644); err != nil {
+	if err := fileutil.WriteFileAtomic(m.srcPath, input, 0644); err != nil {
 		return false, fmt.Errorf("failed to write radio-gaga config: %w", err)
 	}
 	log.Printf("radio-gaga: updated config.yaml from USB drive")

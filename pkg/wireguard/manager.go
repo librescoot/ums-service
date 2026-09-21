@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/librescoot/ums-service/pkg/fileutil"
 )
 
 type Manager struct {
@@ -154,7 +156,7 @@ func (m *Manager) SyncFromUSB(ctx context.Context, usbMountPath string) (bool, e
 			if err := ctx.Err(); err != nil {
 				return false, err
 			}
-			if err := os.WriteFile(destPath, input, 0644); err != nil {
+			if err := fileutil.WriteFileAtomic(destPath, input, 0644); err != nil {
 				log.Printf("Failed to write %s: %v", destPath, err)
 				continue
 			}

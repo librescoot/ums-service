@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 
 	"github.com/BurntSushi/toml"
+	"github.com/librescoot/ums-service/pkg/fileutil"
 )
 
 type Loader struct {
@@ -87,7 +88,7 @@ func (l *Loader) CopyFromUSB(ctx context.Context, usbMountPath string) (bool, er
 		if err := ctx.Err(); err != nil {
 			return false, err
 		}
-		if err := os.WriteFile(l.settingsFile, input, 0644); err != nil {
+		if err := fileutil.WriteFileAtomic(l.settingsFile, input, 0644); err != nil {
 			return false, fmt.Errorf("failed to write settings file: %w", err)
 		}
 		log.Printf("Updated settings.toml from USB drive")

@@ -3,7 +3,6 @@ package update
 import (
 	"context"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -14,6 +13,7 @@ import (
 
 	ipc "github.com/librescoot/redis-ipc"
 	"github.com/librescoot/ums-service/pkg/dbc"
+	"github.com/librescoot/ums-service/pkg/fileutil"
 	"github.com/librescoot/ums-service/pkg/umslog"
 )
 
@@ -519,23 +519,7 @@ func (l *Loader) processMDBUpdate(logger *umslog.Logger, srcPaths []string) (Pen
 }
 
 func copyFile(src, dst string) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-
-	out, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-
-	if _, err := io.Copy(out, in); err != nil {
-		return err
-	}
-
-	return out.Sync()
+	return fileutil.CopyFileAtomic(src, dst, 0644)
 }
 
 func (l *Loader) processDBCUpdate(ctx context.Context, timeout time.Duration, logger *umslog.Logger, srcPaths []string) (PendingPush, error) {
