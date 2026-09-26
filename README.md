@@ -68,6 +68,17 @@ The service has no general command-line configuration; `--version` or `-version`
 
 Invalid timeout values are logged and fall back to their defaults. The virtual-drive path and size are currently configured in the program as `/data/usb.drive` and 1 GiB.
 
+## Regional offline maps
+
+USB update mode accepts multiple `maps/tiles_<slug>.mbtiles` files and matching
+`maps/valhalla_tiles_<slug>.tar` or `.tar.zst` files in one operation. Files are
+installed under their regional names on the DBC. A fresh installation creates
+`/data/valhalla/tiles.tar` as a symlink to the first installed routing archive
+for scootui-qt to switch by GPS position. An existing regular `tiles.tar` is
+left untouched; it must be migrated to a regional archive and symlink explicitly
+before automatic routing switches can work. When both compressed and plain
+routing files for a slug are on the stick, the compressed file is used.
+
 ## Build and test
 
 A Go toolchain is required. The default target cross-compiles a Linux ARMv7 binary.

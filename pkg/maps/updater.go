@@ -88,6 +88,8 @@ func (u *Updater) ProcessMaps(ctx context.Context, perFileTimeout time.Duration,
 	}
 
 	var mbtilesFile, tilesFile string
+	var regionalMaps []string
+	regionalRouting := make(map[string]string)
 
 	// Find map files
 	for _, entry := range entries {
@@ -96,14 +98,24 @@ func (u *Updater) ProcessMaps(ctx context.Context, perFileTimeout time.Duration,
 		}
 
 		filename := entry.Name()
-		if strings.HasSuffix(filename, ".mbtiles") {
+		if strings.HasPrefix(filename, "tiles_") && strings.HasSuffix(filename, ".mbtiles") && validRegionalName(filename[len("tiles_"):len(filename)-len(".mbtiles")]) {
+			regionalMaps = append(regionalMaps, filepath.Join(mapsDir, filename))
+		} else if filename == "map.mbtiles" {
 			mbtilesFile = filepath.Join(mapsDir, filename)
+		} else if strings.HasPrefix(filename, "valhalla_tiles_") && IsValhallaTilesArchive(filename) {
+			slug := strings.TrimSuffix(strings.TrimSuffix(strings.TrimPrefix(filename, "valhalla_tiles_"), ".zst"), ".tar")
+			if validRegionalName(slug) {
+				// Prefer compressed form if both variants are present.
+				if _, found := regionalRouting[slug]; !found || strings.HasSuffix(filename, ".zst") {
+					regionalRouting[slug] = filepath.Join(mapsDir, filename)
+				}
+			}
 		} else if IsValhallaTilesArchive(filename) {
 			tilesFile = filepath.Join(mapsDir, filename)
 		}
 	}
 
-	if mbtilesFile == "" && tilesFile == "" {
+	if mbtilesFile == "" && tilesFile == "" && len(regionalMaps) == 0 && len(regionalRouting) == 0 {
 		log.Println("No map files found to process")
 		return nil
 	}
@@ -112,6 +124,11 @@ func (u *Updater) ProcessMaps(ctx context.Context, perFileTimeout time.Duration,
 		return fmt.Errorf("DBC interface not enabled for map updates")
 	}
 
+	if len(regionalMaps) > 0 || len(regionalRouting) > 0 {
+		// A mixed USB stick must not replace the active regional symlink with
+		// a legacy archive or downgrade the display to a singleton map.
+		mbtilesFile, tilesFile = "", ""
+	}
 	if mbtilesFile != "" {
 		if err := u.processMBTiles(ctx, perFileTimeout, logger, mbtilesFile); err != nil {
 			return fmt.Errorf("failed to process mbtiles: %w", err)
@@ -123,8 +140,47 @@ func (u *Updater) ProcessMaps(ctx context.Context, perFileTimeout time.Duration,
 			return fmt.Errorf("failed to process tiles.tar: %w", err)
 		}
 	}
-
+	for _, path := range regionalMaps {
+		if err := u.processMBTiles(ctx, perFileTimeout, logger, path); err != nil {
+			return fmt.Errorf("failed to install %s: %w", filepath.Base(path), err)
+		}
+	}
+	for _, path := range regionalMaps {
+		slug := strings.TrimSuffix(strings.TrimPrefix(filepath.Base(path), "tiles_"), ".mbtiles")
+		if archive := regionalRouting[slug]; archive != "" {
+			if err := u.processTilesTar(ctx, perFileTimeout, logger, archive); err != nil {
+				return fmt.Errorf("failed to install %s: %w", filepath.Base(archive), err)
+			}
+			delete(regionalRouting, slug)
+		}
+	}
+	// Routing-only updates are also accepted.
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasPrefix(name, "valhalla_tiles_") {
+			continue
+		}
+		slug := strings.TrimSuffix(strings.TrimSuffix(strings.TrimPrefix(name, "valhalla_tiles_"), ".zst"), ".tar")
+		if archive := regionalRouting[slug]; archive != "" {
+			if err := u.processTilesTar(ctx, perFileTimeout, logger, archive); err != nil {
+				return err
+			}
+			delete(regionalRouting, slug)
+		}
+	}
 	return nil
+}
+
+func validRegionalName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, ch := range name {
+		if !(ch >= 'a' && ch <= 'z' || ch >= '0' && ch <= '9' || ch == '-' || ch == '_') {
+			return false
+		}
+	}
+	return true
 }
 
 func (u *Updater) processMBTiles(ctx context.Context, timeout time.Duration, logger *umslog.Logger, localPath string) error {
@@ -135,7 +191,11 @@ func (u *Updater) processMBTiles(ctx context.Context, timeout time.Duration, log
 		return fmt.Errorf("failed to create remote maps directory: %w", err)
 	}
 
-	remotePath := filepath.Join(u.dbcMapsDir, "map.mbtiles")
+	remoteName := "map.mbtiles"
+	if strings.HasPrefix(filepath.Base(localPath), "tiles_") {
+		remoteName = filepath.Base(localPath)
+	}
+	remotePath := filepath.Join(u.dbcMapsDir, remoteName)
 	uploadPath := remotePath + ".tmp"
 
 	var progress dbc.ProgressFunc
@@ -157,7 +217,9 @@ func (u *Updater) processMBTiles(ctx context.Context, timeout time.Duration, log
 	// Bookkeeping runs on the parent context, not opCtx: the transfer may have
 	// used most of the per-file budget, and recording what landed is worth a
 	// few more seconds even when it did.
-	u.recordInstall(ctx, true, filepath.Base(localPath), remotePath)
+	if remoteName == "map.mbtiles" {
+		u.recordInstall(ctx, true, filepath.Base(localPath), remotePath)
+	}
 	return nil
 }
 
@@ -193,8 +255,17 @@ func (u *Updater) processTilesTar(ctx context.Context, timeout time.Duration, lo
 		return fmt.Errorf("failed to create remote valhalla directory: %w", err)
 	}
 
-	remotePath := filepath.Join(u.dbcValhallaDir, "tiles.tar")
-	uploadPath := remotePath
+	remoteName := "tiles.tar"
+	if strings.HasPrefix(filepath.Base(localPath), "valhalla_tiles_") {
+		remoteName = strings.TrimSuffix(filepath.Base(localPath), ".zst")
+	}
+	remotePath := filepath.Join(u.dbcValhallaDir, remoteName)
+	if remoteName == "tiles.tar" {
+		if _, err := u.dbcInterface.RunCommand(opCtx, "test ! -L "+remotePath); err != nil {
+			return fmt.Errorf("cannot replace an active regional routing symlink with a legacy archive: %w", err)
+		}
+	}
+	uploadPath := remotePath + ".tmp"
 	compressed := isCompressedTilesArchive(localPath)
 	if compressed {
 		uploadPath = remotePath + ".zst"
@@ -241,10 +312,29 @@ func (u *Updater) processTilesTar(ctx context.Context, timeout time.Duration, lo
 		if _, err := u.dbcInterface.RunCommand(opCtx, "rm -f "+uploadPath); err != nil {
 			log.Printf("Could not remove %s from DBC after decompress: %v", uploadPath, err)
 		}
+	} else if _, err := u.dbcInterface.RunCommand(opCtx,
+		fmt.Sprintf("mv -f %s %s", uploadPath, remotePath)); err != nil {
+		u.cleanupRemote(opCtx, uploadPath)
+		return fmt.Errorf("failed to install routing archive: %w", err)
 	}
 
+	if remoteName != "tiles.tar" {
+		// Leave an existing legacy archive untouched. On a new installation the
+		// canonical path is a symlink that the dashboard can switch atomically.
+		active := filepath.Join(u.dbcValhallaDir, "tiles.tar")
+		cmd := fmt.Sprintf("if [ ! -e %s ] && [ ! -L %s ]; then ln -s %s %s; fi", active, active, remotePath, active)
+		if _, err := u.dbcInterface.RunCommand(opCtx, cmd); err != nil {
+			return fmt.Errorf("failed to activate routing archive: %w", err)
+		}
+		if _, err := u.dbcInterface.RunCommand(opCtx,
+			fmt.Sprintf("if [ \"$(readlink -f %s)\" = %s ]; then systemctl restart valhalla; fi", active, remotePath)); err != nil {
+			return fmt.Errorf("failed to restart routing service: %w", err)
+		}
+	}
 	log.Printf("Successfully installed tiles archive on DBC at %s", remotePath)
 
-	u.recordInstall(ctx, false, filepath.Base(localPath), remotePath)
+	if remoteName == "tiles.tar" {
+		u.recordInstall(ctx, false, filepath.Base(localPath), remotePath)
+	}
 	return nil
 }

@@ -30,6 +30,19 @@ func TestIsValhallaTilesArchive(t *testing.T) {
 	}
 }
 
+func TestValidRegionalName(t *testing.T) {
+	for _, name := range []string{"bayern", "berlin_brandenburg", "ile-de-france"} {
+		if !validRegionalName(name) {
+			t.Errorf("rejected %q", name)
+		}
+	}
+	for _, name := range []string{"", "../foo", "foo;reboot", "Foo"} {
+		if validRegionalName(name) {
+			t.Errorf("accepted %q", name)
+		}
+	}
+}
+
 func TestProcessMapsEmptyDirectoryDoesNotRequireDBC(t *testing.T) {
 	root := t.TempDir()
 	if err := os.Mkdir(filepath.Join(root, "maps"), 0o755); err != nil {
