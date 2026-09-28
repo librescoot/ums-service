@@ -87,85 +87,70 @@ func (u *Updater) ProcessMaps(ctx context.Context, perFileTimeout time.Duration,
 		return fmt.Errorf("failed to read maps directory: %w", err)
 	}
 
-	var mbtilesFile, tilesFile string
-	var regionalMaps []string
-	regionalRouting := make(map[string]string)
-
-	// Find map files
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-
-		filename := entry.Name()
-		if strings.HasPrefix(filename, "tiles_") && strings.HasSuffix(filename, ".mbtiles") && validRegionalName(filename[len("tiles_"):len(filename)-len(".mbtiles")]) {
-			regionalMaps = append(regionalMaps, filepath.Join(mapsDir, filename))
-		} else if filename == "map.mbtiles" {
-			mbtilesFile = filepath.Join(mapsDir, filename)
-		} else if strings.HasPrefix(filename, "valhalla_tiles_") && IsValhallaTilesArchive(filename) {
-			slug := strings.TrimSuffix(strings.TrimSuffix(strings.TrimPrefix(filename, "valhalla_tiles_"), ".zst"), ".tar")
-			if validRegionalName(slug) {
-				// Prefer compressed form if both variants are present.
-				if _, found := regionalRouting[slug]; !found || strings.HasSuffix(filename, ".zst") {
-					regionalRouting[slug] = filepath.Join(mapsDir, filename)
-				}
-			}
-		} else if IsValhallaTilesArchive(filename) {
-			tilesFile = filepath.Join(mapsDir, filename)
-		}
-	}
-
-	if mbtilesFile == "" && tilesFile == "" && len(regionalMaps) == 0 && len(regionalRouting) == 0 {
+	files := selectMapFiles(entries, mapsDir)
+	if files.legacyMap == "" && files.legacyRouting == "" {
 		log.Println("No map files found to process")
 		return nil
 	}
-
 	if !u.dbcInterface.IsEnabled() {
 		return fmt.Errorf("DBC interface not enabled for map updates")
 	}
 
-	if len(regionalMaps) > 0 || len(regionalRouting) > 0 {
-		// A mixed USB stick must not replace the active regional symlink with
-		// a legacy archive or downgrade the display to a singleton map.
-		mbtilesFile, tilesFile = "", ""
-	}
-	if mbtilesFile != "" {
-		if err := u.processMBTiles(ctx, perFileTimeout, logger, mbtilesFile); err != nil {
-			return fmt.Errorf("failed to process mbtiles: %w", err)
+	regional := files.explicitRegional || len(files.regionalMaps) > 1
+	if !regional && (len(files.regionalMaps) > 0 || len(files.regionalRouting) > 0) {
+		active := filepath.Join(u.dbcValhallaDir, "tiles.tar")
+		state, err := u.dbcInterface.RunCommand(ctx,
+			fmt.Sprintf("if [ -L %s ]; then echo regional; else echo legacy; fi", active))
+		if err != nil {
+			return fmt.Errorf("failed to identify map installation mode: %w", err)
 		}
+		regional = strings.TrimSpace(state) == "regional"
 	}
 
-	if tilesFile != "" {
-		if err := u.processTilesTar(ctx, perFileTimeout, logger, tilesFile); err != nil {
-			return fmt.Errorf("failed to process tiles.tar: %w", err)
+	if !regional {
+		if files.legacyMap != "" {
+			if err := u.processMBTiles(ctx, perFileTimeout, logger, files.legacyMap, false); err != nil {
+				return fmt.Errorf("failed to process mbtiles: %w", err)
+			}
 		}
+		if files.legacyRouting != "" {
+			if err := u.processTilesTar(ctx, perFileTimeout, logger, files.legacyRouting, false); err != nil {
+				return fmt.Errorf("failed to process tiles.tar: %w", err)
+			}
+		}
+		return nil
 	}
-	for _, path := range regionalMaps {
-		if err := u.processMBTiles(ctx, perFileTimeout, logger, path); err != nil {
+
+	if len(files.regionalMaps) == 0 && len(files.regionalRouting) == 0 {
+		return fmt.Errorf("regional-packs requested but no regional files found")
+	}
+	// A mixed stick must not replace an active regional symlink with a legacy
+	// archive or downgrade its display to a singleton map.
+	for _, path := range files.regionalMaps {
+		if err := u.processMBTiles(ctx, perFileTimeout, logger, path, true); err != nil {
 			return fmt.Errorf("failed to install %s: %w", filepath.Base(path), err)
 		}
 	}
-	for _, path := range regionalMaps {
+	for _, path := range files.regionalMaps {
 		slug := strings.TrimSuffix(strings.TrimPrefix(filepath.Base(path), "tiles_"), ".mbtiles")
-		if archive := regionalRouting[slug]; archive != "" {
-			if err := u.processTilesTar(ctx, perFileTimeout, logger, archive); err != nil {
+		if archive := files.regionalRouting[slug]; archive != "" {
+			if err := u.processTilesTar(ctx, perFileTimeout, logger, archive, true); err != nil {
 				return fmt.Errorf("failed to install %s: %w", filepath.Base(archive), err)
 			}
-			delete(regionalRouting, slug)
+			delete(files.regionalRouting, slug)
 		}
 	}
-	// Routing-only updates are also accepted.
 	for _, entry := range entries {
 		name := entry.Name()
 		if !strings.HasPrefix(name, "valhalla_tiles_") {
 			continue
 		}
 		slug := strings.TrimSuffix(strings.TrimSuffix(strings.TrimPrefix(name, "valhalla_tiles_"), ".zst"), ".tar")
-		if archive := regionalRouting[slug]; archive != "" {
-			if err := u.processTilesTar(ctx, perFileTimeout, logger, archive); err != nil {
-				return err
+		if archive := files.regionalRouting[slug]; archive != "" {
+			if err := u.processTilesTar(ctx, perFileTimeout, logger, archive, true); err != nil {
+				return fmt.Errorf("failed to install %s: %w", filepath.Base(archive), err)
 			}
-			delete(regionalRouting, slug)
+			delete(files.regionalRouting, slug)
 		}
 	}
 	return nil
@@ -183,7 +168,7 @@ func validRegionalName(name string) bool {
 	return true
 }
 
-func (u *Updater) processMBTiles(ctx context.Context, timeout time.Duration, logger *umslog.Logger, localPath string) error {
+func (u *Updater) processMBTiles(ctx context.Context, timeout time.Duration, logger *umslog.Logger, localPath string, regional bool) error {
 	opCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
@@ -192,7 +177,7 @@ func (u *Updater) processMBTiles(ctx context.Context, timeout time.Duration, log
 	}
 
 	remoteName := "map.mbtiles"
-	if strings.HasPrefix(filepath.Base(localPath), "tiles_") {
+	if regional {
 		remoteName = filepath.Base(localPath)
 	}
 	remotePath := filepath.Join(u.dbcMapsDir, remoteName)
@@ -247,7 +232,7 @@ func (u *Updater) cleanupRemote(opCtx context.Context, paths ...string) {
 	}
 }
 
-func (u *Updater) processTilesTar(ctx context.Context, timeout time.Duration, logger *umslog.Logger, localPath string) error {
+func (u *Updater) processTilesTar(ctx context.Context, timeout time.Duration, logger *umslog.Logger, localPath string, regional bool) error {
 	opCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
@@ -256,7 +241,7 @@ func (u *Updater) processTilesTar(ctx context.Context, timeout time.Duration, lo
 	}
 
 	remoteName := "tiles.tar"
-	if strings.HasPrefix(filepath.Base(localPath), "valhalla_tiles_") {
+	if regional {
 		remoteName = strings.TrimSuffix(filepath.Base(localPath), ".zst")
 	}
 	remotePath := filepath.Join(u.dbcValhallaDir, remoteName)

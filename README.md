@@ -71,13 +71,20 @@ Invalid timeout values are logged and fall back to their defaults. The virtual-d
 ## Regional offline maps
 
 USB update mode accepts multiple `maps/tiles_<slug>.mbtiles` files and matching
-`maps/valhalla_tiles_<slug>.tar` or `.tar.zst` files in one operation. Files are
-installed under their regional names on the DBC. A fresh installation creates
+`maps/valhalla_tiles_<slug>.tar` or `.tar.zst` files in one operation. Two or
+more named map files opt into regional installation. A single named pair on a
+legacy stick keeps installing as `map.mbtiles` and `tiles.tar`; to opt into
+regional installation for one pair, add an empty `maps/regional-packs` file.
+An already active regional installation (symlinked `tiles.tar`) also accepts
+single-pack or routing-only updates without a marker.
+
+Regional files keep their names on the DBC. A fresh installation creates
 `/data/valhalla/tiles.tar` as a symlink to the first installed routing archive
 for scootui-qt to switch by GPS position. An existing regular `tiles.tar` is
-left untouched; it must be migrated to a regional archive and symlink explicitly
-before automatic routing switches can work. When both compressed and plain
-routing files for a slug are on the stick, the compressed file is used.
+left untouched; preserve it as a correctly named regional archive and replace
+it with a symlink explicitly before automatic routing switches can work.
+When both compressed and plain routing files for a slug are on the stick, the
+compressed file is used.
 
 ## Build and test
 
